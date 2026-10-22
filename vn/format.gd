@@ -46,7 +46,11 @@ const MAGIC := "VNBC"
 ## v5 没有改字段布局，升版本是因为**指令的语义变了**：ATL 语句树里出现了
 ## wait 与 use 两种节点，show 的 at 后面多了保留目标 end。旧引擎读到它们
 ## 只会静默跳过 —— 动画一声不响地不动，比拒绝加载难查得多
-const FORMAT_VERSION := 5
+##
+## v6 加了 default 表（变量声明）。它排在 transform 表之后、指令之前，
+## v5 及更早的包里没有这一段，读出来是空表 —— 旧包仍然能跑，
+## 只是没有变量可用
+const FORMAT_VERSION := 6
 ## 读取端能接受的最低版本。v2 没有 image 表、v3 没有 transform 表，
 ## v5 之前的 transform 树里没有 wait / use，其余结构相同
 const MIN_VERSION := 2
@@ -91,7 +95,8 @@ static func unseal(sealed: PackedByteArray) -> PackedByteArray:
 ## images / transforms 为空时结果与旧版本完全一致 —— 空表不产生任何 parts，
 ## 所以拿它校验旧包仍然对得上
 static func compute_checksum(ops: Array[Dictionary], labels: Array[Dictionary],
-		images: Dictionary = {}, transforms: Dictionary = {}) -> int:
+		images: Dictionary = {}, transforms: Dictionary = {},
+		defaults: Array[Dictionary] = []) -> int:
 	var parts := PackedStringArray()
 	for label in labels:
 		parts.append(str(label.get("name", "")))
@@ -102,6 +107,10 @@ static func compute_checksum(ops: Array[Dictionary], labels: Array[Dictionary],
 	for name in transforms:
 		parts.append(String(name))
 		parts.append(String(transforms[name]))
+	for d in defaults:
+		parts.append(str(d.get("path", "")))
+		parts.append(str(d.get("kind", "")))
+		parts.append(str(d.get("value", "")))
 	for op in ops:
 		parts.append(str(op.get("sid", 0)))
 		parts.append(str(op.get("op", "")))
@@ -124,10 +133,12 @@ static func content_key(op: Dictionary) -> String:
 #  编解码
 ###########################################################
 
-## 把指令、label 表、image 表与 transform 表编码成未压缩字节流（尾部含 checksum）
+## 把指令、label 表、image 表、transform 表与 default 表编码成未压缩字节流
+## （尾部含 checksum）
 static func encode(ops: Array[Dictionary], labels: Array[Dictionary],
 		images: Dictionary = {},
-		transforms: Dictionary = {}) -> PackedByteArray:
+		transforms: Dictionary = {},
+		defaults: Array[Dictionary] = []) -> PackedByteArray:
 	var sp := StreamPeerBuffer.new()
 
 	sp.put_data(MAGIC.to_ascii_buffer())
@@ -136,6 +147,7 @@ static func encode(ops: Array[Dictionary], labels: Array[Dictionary],
 	sp.put_32(labels.size())
 	sp.put_32(images.size())
 	sp.put_32(transforms.size())
+	sp.put_32(defaults.size())
 
 	for label in labels:
 		sp.put_utf8_string(str(label.get("name", "")))
@@ -149,6 +161,12 @@ static func encode(ops: Array[Dictionary], labels: Array[Dictionary],
 		sp.put_utf8_string(String(name))
 		sp.put_utf8_string(String(transforms[name]))
 
+	# default 表（v6 起）。path / kind / value 三段，与 set 指令的前三段同形状
+	for d in defaults:
+		sp.put_utf8_string(String(d.get("path", "")))
+		sp.put_utf8_string(String(d.get("kind", "")))
+		sp.put_utf8_string(String(d.get("value", "")))
+
 	for op in ops:
 		sp.put_64(int(op.get("sid", 0)))
 		sp.put_utf8_string(str(op.get("op", "")))
@@ -158,7 +176,7 @@ static func encode(ops: Array[Dictionary], labels: Array[Dictionary],
 		for a in args:
 			sp.put_utf8_string(String(a))
 
-	sp.put_64(compute_checksum(ops, labels, images, transforms))
+	sp.put_64(compute_checksum(ops, labels, images, transforms, defaults))
 	return sp.data_array
 
 ## 解码未压缩字节流。
@@ -169,6 +187,7 @@ static func decode(raw: PackedByteArray) -> Dictionary:
 	var labels: Array[Dictionary] = []
 	var images: Dictionary = {}
 	var transforms: Dictionary = {}
+	var defaults: Array[Dictionary] = []
 	var version := 0
 
 	if raw.size() < MIN_SIZE:
@@ -208,6 +227,13 @@ static func decode(raw: PackedByteArray) -> Dictionary:
 		if transform_count < 0:
 			return _failure("transform 表记录数非法")
 
+	# default_count（v6 起）
+	var default_count := 0
+	if version >= 6:
+		default_count = sp.get_32()
+		if default_count < 0:
+			return _failure("default 表记录数非法")
+
 	# ── label 表 ──
 	for _i in label_count:
 		if sp.get_available_bytes() < 4:
@@ -235,6 +261,16 @@ static func decode(raw: PackedByteArray) -> Dictionary:
 		if not atl_name.is_empty():
 			transforms[atl_name] = atl_source
 
+	# ── default 表（v6 起）──
+	for _i in default_count:
+		if sp.get_available_bytes() < 4:
+			return _failure("default 表被截断")
+		var var_path := _read_string(sp)
+		var var_kind := _read_string(sp)
+		var var_value := _read_string(sp)
+		if not var_path.is_empty():
+			defaults.append({"path": var_path, "kind": var_kind, "value": var_value})
+
 	# ── 指令记录 ──
 	for _i in op_count:
 		if sp.get_available_bytes() < 8:
@@ -252,13 +288,13 @@ static func decode(raw: PackedByteArray) -> Dictionary:
 	# ── 尾部 checksum ──
 	if sp.get_available_bytes() < 8:
 		return _failure("缺少结尾校验和，文件可能被截断")
-	if sp.get_64() != compute_checksum(ops, labels, images, transforms):
+	if sp.get_64() != compute_checksum(ops, labels, images, transforms, defaults):
 		return _failure("校验和不符，文件已损坏或被修改")
 
 	return {
 		"ok": true, "error": "", "version": version,
 		"ops": ops, "labels": labels, "images": images,
-		"transforms": transforms,
+		"transforms": transforms, "defaults": defaults,
 	}
 
 ## 读一个带 u32 长度前缀的 UTF-8 字符串。
@@ -277,10 +313,11 @@ static func _failure(message: String) -> Dictionary:
 	var labels: Array[Dictionary] = []
 	var images: Dictionary = {}
 	var transforms: Dictionary = {}
+	var defaults: Array[Dictionary] = []
 	return {
 		"ok": false, "error": message, "version": 0,
 		"ops": ops, "labels": labels, "images": images,
-		"transforms": transforms,
+		"transforms": transforms, "defaults": defaults,
 	}
 
 ###########################################################
@@ -290,12 +327,13 @@ static func _failure(message: String) -> Dictionary:
 ## 写一个 .vnbc 文件。返回是否成功
 static func write_file(path: String, ops: Array[Dictionary],
 		labels: Array[Dictionary], images: Dictionary = {},
-		transforms: Dictionary = {}) -> bool:
+		transforms: Dictionary = {},
+		defaults: Array[Dictionary] = []) -> bool:
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:
 		push_error("无法写入剧本文件 %s（错误码 %d）" % [path, FileAccess.get_open_error()])
 		return false
-	f.store_buffer(seal(encode(ops, labels, images, transforms)))
+	f.store_buffer(seal(encode(ops, labels, images, transforms, defaults)))
 	f.close()
 	return true
 

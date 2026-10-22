@@ -13,6 +13,8 @@ var labels: Array[Dictionary] = []
 var images: Dictionary = {}
 ## transform 名 → ATL 语句树
 var transforms: Dictionary = {}
+## 变量声明表，每项 { path, kind, value }。开新局时由 VNPlayer 灌进 session
+var defaults: Array[Dictionary] = []
 ## 剧本格式版本
 var format_version: int = 0
 
@@ -33,6 +35,7 @@ func load_story(p_path: String) -> bool:
 	labels = fresh.labels
 	images = fresh.images
 	transforms = fresh.transforms
+	defaults = fresh.defaults
 	format_version = fresh.format_version
 	return true
 

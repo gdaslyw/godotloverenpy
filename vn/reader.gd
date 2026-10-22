@@ -17,6 +17,9 @@ var images: Dictionary = {}
 ## transform 名 → ATL 语句树。.vnbc 里存的是 JSON，这里解析成数组，
 ## 运行时不再反复 parse —— ATL 每帧都要推进，不该在热路径上碰字符串
 var transforms: Dictionary = {}
+## 变量声明表，每项 { path, kind, value }。
+## 编译器从各文件的顶层 default 汇总，运行时开新局时按它灌初值
+var defaults: Array[Dictionary] = []
 ## 文件里记录的格式版本
 var format_version: int = 0
 
@@ -53,6 +56,7 @@ func load_from(path: String) -> bool:
 	label_index = table
 	images = result["images"]
 	transforms = parsed_transforms
+	defaults = result.get("defaults", [])
 	format_version = result["version"]
 	return true
 

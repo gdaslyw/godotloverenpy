@@ -100,6 +100,28 @@ var window_alpha := DEFAULT_WINDOW_ALPHA
 var dialog_font := ""
 
 ###########################################################
+#  多语言
+###########################################################
+
+## 当前界面语言（locale）。**空串表示没设置过**，实际生效值见
+## resolved_language()。
+##
+## 存 locale 而不是语言列表下标：settings.cfg 是留给人手改的，"ja" 比 "2"
+## 清楚得多，而且将来语言表调整顺序时不会把玩家的选择错位。
+##
+## 认不出的写法不会报错 —— 那可能是曾经做过、后来删掉的语言，
+## 归一化时落到作品配置的默认语言
+var language := ""
+
+## 实际生效的语言。
+##
+## 空串、旧语言名、带地区的写法（"zh-CN"）都在 VNI18n.normalize() 里归一。
+## 界面上要判断"现在是哪种语言"一律问这个，不要直接读 language 字段 ——
+## 那个可能是空串
+func resolved_language() -> String:
+	return VNI18n.normalize(language)
+
+###########################################################
 #  光标
 ###########################################################
 
@@ -342,15 +364,27 @@ func _first_window_size() -> Vector2i:
 
 ## 实际生效的正文字体路径。
 ##
-## 配置里存空串时取作品配置表里的第一项 —— 那等于"出厂字体"。
-## 表为空则返回空串，调用方据此跳过应用，而不是去 load 一个空路径
+## ── 非源语言不看玩家的字体选择 ──
+## 设置页里能选的那四种字体全是中文字体（圆/楷/宋/黑），日文界面用它们
+## 会缺假名、繁中界面会缺繁体专用字。所以除简中之外一律按作品配置表的
+## language_fonts 走。原项目切语言时也是直接把 dialog_font 覆盖掉
+## （screen/preferences.rpy:240-281），取舍相同
+##
+## ── 源语言下 ──
+## 玩家挑了就用玩家的；没挑过（空串）就用作品配置表的第一项，那等于
+## "出厂字体"。两张表都不空时优先 dialog_fonts —— 它是简中四体的权威表，
+## language_fonts 里那份只是给"别的语言"用的
 func dialog_font_path() -> String:
+	var current := resolved_language()
+	if not VNI18n.is_source(current):
+		return VNI18n.font_path(VNI18n.FONT_DIALOG, current)
+
 	if not dialog_font.is_empty():
 		return dialog_font
 
 	var fonts: Array = VNSettings.get_current().dialog_fonts
 	if fonts.is_empty():
-		return ""
+		return VNI18n.font_path(VNI18n.FONT_DIALOG, VNI18n.ZH_HANS)
 	return String(fonts[0].get("path", ""))
 
 ###########################################################
@@ -473,6 +507,10 @@ func load_config() -> void:
 		0.0)
 	qm_auto_hide = bool(cfg.get_value(SECTION, "qm_auto_hide", DEFAULT_QM_AUTO_HIDE))
 	dialog_font = String(cfg.get_value(SECTION, "dialog_font", ""))
+	# 语言：读进来先归一。写错的名字（旧版本留下的）在这里就被纠正成
+	# 四种语言之一，后面所有读它的地方都不必再自己判一次
+	language = VNI18n.normalize(
+		String(cfg.get_value(SECTION, "language", settings.default_language)))
 
 	# 窗口。宽高分开存两个 int 而不是一个 Vector2i —— 这个文件是留给人
 	# 手改的，两行数字比 Vector2i(1920, 1080) 好认得多
@@ -501,6 +539,7 @@ func save_config() -> bool:
 	cfg.set_value(SECTION, "mouse_hide_time", mouse_hide_time)
 	cfg.set_value(SECTION, "qm_auto_hide", qm_auto_hide)
 	cfg.set_value(SECTION, "dialog_font", dialog_font)
+	cfg.set_value(SECTION, "language", language)
 	cfg.set_value(SECTION, "fullscreen", fullscreen)
 	cfg.set_value(SECTION, "window_width", window_size.x)
 	cfg.set_value(SECTION, "window_height", window_size.y)

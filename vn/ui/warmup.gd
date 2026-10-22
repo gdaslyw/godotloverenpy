@@ -131,6 +131,25 @@ func cancel(scene: PackedScene) -> void:
 		if is_instance_valid(node):
 			node.queue_free()
 
+## 丢弃池里和队列里的全部登记。
+##
+## 切语言时调一次。池里存的是**用旧语言、旧字体建好的实例**：Label 上的
+## 文字在 _ready() 那一刻就定下来了，引擎不会因为 set_locale 回头改它。
+## 不丢的话，切完语言再点设置页会拿到一个预热过的旧语言页面 ——
+## 而且它看起来完全正常，不会有任何报错
+##
+## 这里用 queue_free 而不是 free：调用点可能正处在某个节点的信号回调里
+## （语言按钮的 vn_pressed），同步释放会把正在执行回调的那棵树拆掉
+func clear() -> void:
+	for scene: PackedScene in _pool:
+		var node: Node = _pool[scene]
+		if is_instance_valid(node):
+			node.queue_free()
+	_pool.clear()
+
+	_queue.clear()
+	set_process(false)
+
 ###########################################################
 #  构建
 ###########################################################

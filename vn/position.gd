@@ -123,14 +123,22 @@ static func anchors_from(ops: Array[Dictionary], cursor: int,
 ## sid 是旧位置上那一句的 sid，anchors 是它往前的一段（见 anchors_from）。
 ## label_start 是"label 名 → 指令下标"的查询函数，缺省时三级退化到 0。
 ##
-## 返回 { cursor, label_name, call_stack, how }，输入里若有 path 会原样带过去。
-## how 说明走的是哪一级 —— 调用方据此决定要不要 warning，验收时也靠它判断
+## 返回 { cursor, label_name, call_stack, how, sid_found }，输入里若有 path
+## 会原样带过去。
+## how 说明走的是哪一级 —— 调用方据此决定要不要 warning，验收时也靠它判断。
+## sid_found 说明**存档那一句的 sid 还在不在当前指令流里**，用来分清两种
+## 完全不同的处境：
+##   false  剧本真的被改写了，落点是估出来的
+##   true   指令原样还在，只是它不是台词 —— 比如剧本里写的流程存档点
+##          （save "xxx"），存档时游标就停在它上面。这时二级锚点算出来的
+##          位置与存档时**完全一致**，不该报"已被改写"
 static func resolve(snapshot: Dictionary, sid: int, anchors: PackedInt64Array,
 		ops: Array[Dictionary], label_start: Callable = Callable()) -> Dictionary:
 	var label_name := String(snapshot.get("label_name", ""))
 
 	# 建一次表，调用栈、一级、二级全用它
 	var index := build_sid_index(ops)
+	var sid_found := sid != 0 and index.has(sid)
 
 	# ── 调用栈：逐帧按 sid 找回 call 指令，重算 return_index ──
 	#
@@ -160,13 +168,13 @@ static func resolve(snapshot: Dictionary, sid: int, anchors: PackedInt64Array,
 		if not old_stack.is_empty() and old_stack[0] is Dictionary:
 			outer = String((old_stack[0] as Dictionary).get("label_name", ""))
 		return _result(_label_index(label_start, outer), outer, [], HOW_STACK,
-			snapshot)
+			snapshot, sid_found)
 
 	# ── 一级：当前句原样还在 ──
-	if sid != 0 and index.has(sid):
+	if sid_found:
 		var at := int(index[sid])
 		if is_say(ops[at]):
-			return _result(at, label_name, new_stack, HOW_SID, snapshot)
+			return _result(at, label_name, new_stack, HOW_SID, snapshot, true)
 
 	# ── 二级：往前找锚点，按回溯步数推进 ──
 	#
@@ -179,25 +187,28 @@ static func resolve(snapshot: Dictionary, sid: int, anchors: PackedInt64Array,
 			continue
 		var cursor := int(index[anchor_sid]) + (i + 1)
 		if cursor >= 0 and cursor < ops.size():
-			return _result(cursor, label_name, new_stack, HOW_ANCHOR, snapshot)
+			return _result(cursor, label_name, new_stack, HOW_ANCHOR, snapshot,
+				sid_found)
 
 	# ── 三级：退回 label 开头 ──
 	return _result(_label_index(label_start, label_name), label_name, new_stack,
-		HOW_LABEL, snapshot)
+		HOW_LABEL, snapshot, sid_found)
 
 ###########################################################
 #  内部
 ###########################################################
 
 ## 拼一份迁移结果。path 从输入快照里带过来 —— 它是"这是哪个剧本包的快照"
-## 的身份信息，本函数不判断它对不对，那是调用方的事
+## 的身份信息，本函数不判断它对不对，那是调用方的事。
+## sid_found 原样带过去，调用方靠它分辨"估算的落点"与"精确的落点"
 static func _result(cursor: int, label_name: String, call_stack: Array,
-		how: String, snapshot: Dictionary) -> Dictionary:
+		how: String, snapshot: Dictionary, sid_found: bool) -> Dictionary:
 	var out := {
 		"cursor": cursor,
 		"label_name": label_name,
 		"call_stack": call_stack,
 		"how": how,
+		"sid_found": sid_found,
 	}
 	if snapshot.has("path"):
 		out["path"] = snapshot["path"]

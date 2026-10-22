@@ -2,13 +2,13 @@ class_name VNSession
 extends Node
 
 # ═══════════════════════════════════════════════════════════
-#  一局的演出状态。角色属性、舞台内容、对话历史三样都在这里。
+#  一局的演出状态。角色属性、舞台内容、对话历史、剧本变量四样都在这里。
 #
-#  ── 为什么这三样归一处 ──
+#  ── 为什么这四样归一处 ──
 #  它们是同一类东西：**会随存档走、且每次进入一局都会重来一份的状态**。
 #  对应 Ren'Py 那边，它们同属 renpy.execution.Context —— 舞台是 Context 的
 #  scene_lists（execution.py:334），历史是 Context 的历史表，都不是引擎
-#  全局的。所以这不是"把三个字典塞进一个类"，是它们本来就该在一起。
+#  全局的。所以这不是"把四个字典塞进一个类"，是它们本来就该在一起。
 #
 #  ── 与 VNPlayer 的分工 ──
 #    VNSession（本文件）  状态：有什么角色、屏幕上摆着什么、说过什么
@@ -39,6 +39,11 @@ extends Node
 ## 这样"改角色定义"和"读存档"就不会互相覆盖
 const WRITABLE_ROLE_PROPS := ["name"]
 
+## set 路径里保留的首段。set role.<角色>.<属性> 靠它和普通变量区分开。
+## parser 的 RESERVED_PATH_ROOTS 与 VNPlayer 的分流都引用这里 ——
+## 三处写成同一个字面量迟早会走散
+const ROLE_PATH_ROOT := "role"
+
 ## 角色属性的**初始定义**，由 register_roles() / define_role() 灌入。
 ## 只读用途：reset_roles() 从这里重新拷一份出来
 var _role_defs: Dictionary = {}
@@ -46,6 +51,37 @@ var _role_defs: Dictionary = {}
 ## 但只限 WRITABLE_ROLE_PROPS 里的属性 —— 定义型属性放在这里只是为了让
 ## 读取方有一个统一入口，它们永远不会被写
 var _roles: Dictionary = {}
+
+###########################################################
+#  变量
+###########################################################
+
+## 剧本变量的当前值。键是第一段名字，值可以是标量，也可以是嵌套字典
+## （点路径 set a.b.c = 1 会建出 {"a": {"b": {"c": 1}}}）。
+##
+## 和 _roles 一样只存可序列化的原始类型 —— 存档要原样写出去。
+## 类型固定四种：int / float / String / bool，由 parser 在编译期钉死，
+## 这里不做类型推断
+var _vars: Dictionary = {}
+
+## 文本插值的占位符。匹配 [名字]：
+##   [gold] / [route.mao.affection] / [艾玛好感]
+## 匹配不到的两类正好都是 BBCode：
+##   [color=red]  带 =，不收
+##   [/color]     带 /，不收
+## 而 [b] 这种形态上能匹配的，变量表里没有同名变量就原样留下 ——
+## 不为 BBCode 维护白名单，Godot 以后加标签也不用回来改这里。
+##
+## 字符集故意放宽到"除了 [ ] = / 空白之外都收"，而不是 [A-Za-z_]：
+## lexer 的标识符允许非 ASCII，变量名可以是中文，两边必须是同一套规则
+const VAR_PLACEHOLDER := "\\[([^\\[\\]=/\\s]+)\\]"
+
+## 编译好的占位符正则。懒加载 —— 不是每次运行都会做插值
+static var _var_re: RegEx = null
+
+## 某个变量的值变了。path 是完整点路径，value 是**新值**。
+## 玩法侧（成就、UI 数字）可以接它，不必每帧轮询
+signal var_changed(path: String, value: Variant)
 
 ###########################################################
 #  舞台
@@ -66,8 +102,8 @@ var _replaying := false
 ## 对话历史。见 vn/ui/history.gd
 var _history := VNHistory.new()
 
-## 最近一句交给界面的台词文本（已过 tr()）。存档的附言取它 ——
-## 存档记的是"玩家当时读到的那句话"，所以是译文而不是原文
+## 最近一句台词的**原文**。存档的附言取它，显示时才翻译 ——
+## 玩家切语言之后，旧存档槽上的附言也跟着变
 var _last_say_text := ""
 
 ###########################################################
@@ -202,6 +238,167 @@ func restore_roles(saved: Variant) -> void:
 		_roles[String(id)] = target
 
 ###########################################################
+#  变量
+###########################################################
+
+## 写一个变量。path 是点路径，how 是 "="、"+="、"-=" 之一。
+##
+## 中间层缺了就就地补字典：先 set route.mao.affection = 10，
+## 后面再 set route.mao.trust = 5，不需要作者先建 route / mao 两层
+func set_var(path: String, value: Variant, how: String, notify := true) -> void:
+	var segments := path.split(".")
+	if segments.is_empty():
+		return
+
+	var node := _vars
+	# 只走到倒数第二段，最后一格留给赋值
+	for i in segments.size() - 1:
+		var key := segments[i]
+		var child: Variant = node.get(key)
+		if not (child is Dictionary):
+			child = {}
+			node[key] = child
+		node = child as Dictionary
+
+	var leaf := segments[segments.size() - 1]
+	var old: Variant = node.get(leaf)
+	var next: Variant = _combine(old, value, how)
+	node[leaf] = next
+
+	if notify and next != old:
+		var_changed.emit(path, next)
+
+## 变量在不在。变量不存 null，所以 null 等价于"没有"
+func has_var(path: String) -> bool:
+	return var_value(path) != null
+
+## 读一个变量。不存在返回 null。
+##
+## 变量不存 null 值（类型只有四种），所以 null 一定表示"没有"，
+## 调用方不需要额外的 has_var() 判断
+func var_value(path: String) -> Variant:
+	var node: Variant = _vars
+	for segment in path.split("."):
+		if not (node is Dictionary):
+			return null
+		var table := node as Dictionary
+		if not table.has(segment):
+			return null
+		node = table[segment]
+	return node
+
+## 导出变量表（深拷）。存档写它，读档还原它
+func vars_data() -> Dictionary:
+	return _vars.duplicate(true)
+
+## 从存档恢复变量表。旧存档没有这一项，按空表处理
+func restore_vars(saved: Variant) -> void:
+	_vars = (saved as Dictionary).duplicate(true) if saved is Dictionary else {}
+
+## 清空变量。开新局时用 —— 上一局的变量不能漏进下一局
+func clear_vars() -> void:
+	_vars = {}
+
+## 按 default 表重建变量：先清空，再逐条灌初值。
+##
+## defaults 是剧本包的声明表，每项 { path, kind, value }；值按 kind 还原成
+## 对应类型。**只在开新局时调用** —— CONTINUE（章节切换）与读档都不该
+## 把变量打回初值，那会抹掉玩家已经积累的数
+func reset_vars(defaults: Array) -> void:
+	_vars = {}
+	for d in defaults:
+		if not (d is Dictionary):
+			continue
+		set_var(String(d.get("path", "")),
+			decode_value(String(d.get("kind", "s")), String(d.get("value", ""))),
+			"=", false)
+
+## 把 .vnbc / 存档里的字面形式还原成带类型的值。
+## kind 是 s / i / f / b；认不出的按字符串处理（只可能来自手改过的包）
+static func decode_value(kind: String, raw: String) -> Variant:
+	match kind:
+		"i":
+			return int(raw)
+		"f":
+			return float(raw)
+		"b":
+			return raw == "true"
+		_:
+			return raw
+
+## 把旧值与新值按运算符合成。
+##
+## old 为 null（变量还不存在）时一律取新值 —— 相当于从类型的零值起算，
+## 于是 `set gold += 10` 在没先赋初值时也能得到 10
+func _combine(old: Variant, value: Variant, how: String) -> Variant:
+	if how == "=" or old == null:
+		return value
+
+	var both_numbers := _is_number(old) and _is_number(value)
+
+	if how == "+=":
+		if old is String and value is String:
+			return String(old) + String(value)
+		if both_numbers:
+			return old + value
+		push_error("set：\"+=\" 两侧类型不匹配（%s 与 %s）"
+			% [type_string(typeof(old)), type_string(typeof(value))])
+		return old
+
+	if how == "-=":
+		if both_numbers:
+			return old - value
+		push_error("set：\"-=\" 两侧必须是数值（%s 与 %s）"
+			% [type_string(typeof(old)), type_string(typeof(value))])
+		return old
+
+	return value
+
+## 是不是数值类型。int 与 float 可以互相运算，结果是 float
+static func _is_number(value: Variant) -> bool:
+	var t := typeof(value)
+	return t == TYPE_INT or t == TYPE_FLOAT
+
+## 把文本里的 [变量] 换成值，查不到的原样留着。
+##
+## 调用时机固定在 tr() **之后**：译文里同样可以写 [gold]，占位符不参与
+## 翻译匹配（msgid 里带的是名字，译完再换值）。
+##
+## 没有变量表或文本里没有方括号时直接返回 —— 绝大多数台词走这条短路
+func interpolate(text: String) -> String:
+	if _vars.is_empty() or not text.contains("["):
+		return text
+
+	var re := _placeholder_re()
+	var out := ""
+	var last := 0
+	for found in re.search_all(text):
+		var value: Variant = var_value(found.get_string(1))
+		if value == null:
+			continue
+		out += text.substr(last, found.get_start() - last)
+		out += _format_value(value)
+		last = found.get_end()
+
+	if last == 0:
+		return text
+	return out + text.substr(last)
+
+## 变量值的显示形式。bool 输出 true / false，和剧本里写的字面量一致；
+## 浮点交给 str()，2.0 会显示成 "2"
+static func _format_value(value: Variant) -> String:
+	if value is bool:
+		return "true" if value else "false"
+	return str(value)
+
+## 取（并首次编译）占位符正则
+static func _placeholder_re() -> RegEx:
+	if _var_re == null:
+		_var_re = RegEx.new()
+		_var_re.compile(VAR_PLACEHOLDER)
+	return _var_re
+
+###########################################################
 #  舞台：状态读取
 ###########################################################
 
@@ -252,6 +449,31 @@ func apply_poses(poses: Dictionary) -> void:
 		var pose = poses[tag]
 		if pose is Dictionary:
 			_stage[tag]["pose"] = pose
+
+## 用一份舞台快照整个替换当前舞台。读档用。
+##
+## 与 rebuild_stage() 的分工：那边从会话入口重放指令流，要求控制流完全
+## 可复现；这边直接取存档里那一刻的结构。玩家点 {call=} 产生的位置变更
+## 重放看不见，存档又可能正好停在它内部，所以读档这条路必须以快照为准。
+##
+## poses 是存档里那份实时姿态（VN. 的 F_POSE），由显示层在存档时抓的，
+## 比快照里可能残留的旧 pose 更权威，所以放在结构就位之后覆盖。
+##
+## 走 stage_rebuilt 而不是只发 stage_changed：显示层要先把旧节点全丢掉，
+## 否则新旧两份舞台会按增量逻辑互相"就地更新"，留下上一处的残留
+func restore_stage(stage_data: Variant, poses: Dictionary = {}) -> void:
+	_stage.clear()
+	if stage_data is Dictionary:
+		for tag in stage_data:
+			var entry = stage_data[tag]
+			if entry is Dictionary:
+				_stage[String(tag)] = entry.duplicate(true)
+	apply_poses(poses)
+	# 重放模式下不该走到这里，但真走了也别让 stage_rebuilt / stage_changed
+	# 被静默吞掉 —— 那会让显示层永远停在旧画面上
+	_replaying = false
+	stage_rebuilt.emit()
+	_emit_stage()
 
 ## 执行 `show <tag> at end`：让这个 tag 正在播的动画立刻结算到最终态。
 ##
@@ -458,12 +680,17 @@ func restore_history(data: Variant) -> void:
 #  附言
 ###########################################################
 
-## 记下最近一句交给界面的台词文本
+## 记下最近一句台词的**原文**（不是译文）。
+##
+## 存档的附言取它，显示时才翻译 —— 所以切语言之后旧存档的附言也跟着变。
+## 旧存档里存的可能是译文，tr() 查不到会原样返回，两种格式可以共存
 func set_last_say_text(text: String) -> void:
 	_last_say_text = text
 
-## 最近一句台词的文本（已过 tr()）。存档的附言取它。
-## 一局还没显示过任何台词时是空串
+## 最近一句台词的**原文**。一局还没显示过任何台词时是空串。
+##
+## 名字没改是因为调用点只关心"最近说了一句什么"，而"存原文"这件事
+## 由 player 与显示端共同保证，不该在这里再分叉出一个原文字段
 func last_say_text() -> String:
 	return _last_say_text
 

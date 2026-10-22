@@ -189,6 +189,115 @@ var button_activate_sound := ""
 var button_hover_sound := ""
 
 ###########################################################
+#  多语言
+#
+#  这一节只描述"这部作品有哪些语言、每种语言用哪套字体"。
+#  译文本身不在这里 —— 它们是 tl/<locale>/*.po 文件，由 project.godot 的
+#  internationalization/locale/translations 登记后由引擎加载。
+#
+#  路径刻意不放进本文件：如果这里再存一份译文路径，就和 project.godot 有
+#  两个定义点了，而两者不一致时不会有任何报错，只表现为"某个语言的译文
+#  静默不生效"
+###########################################################
+
+## 译文目录，**结尾带斜杠**。
+##
+## 只有开发端的核对脚本会读它（扫 tl/ 下有哪些 .po 和它们的内容）。
+## 运行期不需要这个值 —— 加载由 project.godot 的 translations 列表负责，
+## 那是逐文件的完整路径，比"目录 + 推算文件名"更不容易错
+var translation_dir := "res://tl/"
+
+## 默认语言。首次运行、以及 settings.cfg 里写了认不出的语言时，都落到它。
+##
+## 原项目用 Language(None) 表示简中，且**不跟随系统**（options.rpy 里没有
+## 动 config.language）。这里保持同一个取舍：视觉小说的文本是作品的一部分，
+## 不该因为玩家换了台机器就换一种语言显示
+var default_language := "zh_Hans"
+
+## 语言列表，**顺序就是设置界面上的按钮顺序**。
+##
+## 每项 { "locale": String, "name": String }。
+##   locale  传给 TranslationServer.set_locale() 的标识，也是 tl/ 下的
+##           目录名、PO 头里 Language: 字段的值。三者必须逐字一致
+##   name    该语言**用它自己写**的名字，不参与翻译 —— 玩家在选之前
+##           就该认出自己那一行
+##
+## 加一门语言 = 这里加一行 + tl/<locale>/ 下放译文 + project.godot 登记，
+## 三处都要动。少登记那一步不会报错，只会静默地用不上那份译文
+var languages: Array[Dictionary] = [
+	{"locale": "zh_Hans", "name": "简体中文"},
+	{"locale": "zh_Hant", "name": "繁體中文"},
+	{"locale": "ja", "name": "日本語"},
+	{"locale": "en", "name": "English"},
+]
+
+## 语言 → 字体组。每种语言四个槽位 + 两个排版参数：
+##   ui            一般界面文字（分组标题、列表行）
+##   bold          粗体：页面标题、按钮、侧边栏
+##   artistic      装饰艺术字（页面副标题、侧边栏的英文小字）
+##   dialog        正文（对话框、小说阅读页）
+##   offset_y      正文块顶部相对对话框底图顶部的偏移，像素
+##   line_spacing  额外行距，对应 RichTextLabel 的 line_separation
+##
+## ── 为什么必须分组 ──
+## 简中字体不含假名，日文界面会缺字；简体字库也不含繁中专用字形。
+## 原项目在切语言时同时改 font / bole_font / dialog_font 三档
+## （screen/preferences.rpy:240-281），这里只是把那三档记成一张表。
+##
+## ── 排版参数为什么跟语言走 ──
+## 不同字体的字形高度和基线不一样，同一个 y 偏移套上去有的偏上、有的压底。
+## 原项目在 say.rpy:51-69 给每一档正文单独写了 ypos 与 line_spacing：
+##   简中圆体 1155 / 20、楷体 1165 / 30、宋黑与日文 1150 / 10、繁中 1160 / 15
+## 减掉对话框底图顶部 1039 就是这里的 offset_y
+##
+## 英文在原项目里没有单独那一条（Nunito 不匹配任何一个 elif，落回默认位置），
+## 这里按西文字体的同类项给 111 / 10 —— 和日文那份同一个理由：字形高度接近
+##
+## ── artistic 为什么不按语言变 ──
+## 它是纯粹的装饰手写体，原项目在所有语言下都用同一份
+## SignaturaMonoline_3.ttf，只有"显不显示"随语言变（见 extra.gd）
+##
+## ── 简中那四档与 dialog_fonts 的关系 ──
+## dialog 槽是"玩家没挑过字体时的默认正文"，值和 dialog_fonts 第一项相同。
+## 玩家在设置里挑了楷体之类就以玩家为准 —— 那条路径见
+## VNConfig.dialog_font_path()。其余三种语言不吃玩家的字体选择，直接按
+## 这张表走（原项目切语言时就是这么覆盖掉的）
+var language_fonts := {
+	"zh_Hans": {
+		"ui": "res://content/ui/fonts/AlibabaHealthFont20CN_45R.ttf",
+		"bold": "res://content/ui/fonts/AlibabaHealthFont20CN_85B.ttf",
+		"artistic": "res://content/ui/fonts/SignaturaMonoline_3.ttf",
+		"dialog": "res://content/ui/fonts/AlibabaHealthFont20CN_45R.ttf",
+		"offset_y": 116,
+		"line_spacing": 20,
+	},
+	"zh_Hant": {
+		"ui": "res://content/ui/fonts/Thin.ttf",
+		"bold": "res://content/ui/fonts/Regular.ttf",
+		"artistic": "res://content/ui/fonts/SignaturaMonoline_3.ttf",
+		"dialog": "res://content/ui/fonts/Thin.ttf",
+		"offset_y": 121,
+		"line_spacing": 15,
+	},
+	"ja": {
+		"ui": "res://content/ui/fonts/ZenMaruGothic_Light.ttf",
+		"bold": "res://content/ui/fonts/ZenMaruGothic_Medium.ttf",
+		"artistic": "res://content/ui/fonts/SignaturaMonoline_3.ttf",
+		"dialog": "res://content/ui/fonts/ZenMaruGothic_Light.ttf",
+		"offset_y": 111,
+		"line_spacing": 10,
+	},
+	"en": {
+		"ui": "res://content/ui/fonts/Nunito_Light.ttf",
+		"bold": "res://content/ui/fonts/Nunito_Medium.ttf",
+		"artistic": "res://content/ui/fonts/SignaturaMonoline_3.ttf",
+		"dialog": "res://content/ui/fonts/Nunito_Light.ttf",
+		"offset_y": 111,
+		"line_spacing": 10,
+	},
+}
+
+###########################################################
 #  文本
 ###########################################################
 
@@ -248,12 +357,69 @@ var dialog_fonts: Array[Dictionary] = [
 	},
 ]
 
+## 内联字体标签 {font=名字} 查的目录。名字不带后缀，
+## 由 VNI18n.inline_font_path() 依次试 .ttf / .otf。
+##
+## 和 language_fonts 分开放：那张表是"哪门语言用哪套字体"，
+## 这个是"剧本里临时换字体时去哪找"。玩家挑不了它，只有作者用得上。
+##
+## 存目录而不是"名字 → 完整路径"的映射表：导出后 .ttf 源文件不进包，
+## 只剩 .godot/imported 下的 fontdata，运行时列目录是空的 —— 所以只能
+## 按名字拼路径，再让 ResourceLoader 去认导入资源
+var inline_font_dir := "res://content/ui/fonts/"
+
+## 内联链接 {url=} 的常态颜色
+var link_color := Color("#7ec8e3")
+
+## 内联链接的悬停颜色。
+##
+## 本项目用的是自定义光标图（project.godot 的 mouse_cursor/custom_image），
+## 所以悬停反馈全靠这一档颜色变化 —— 两色要有足够对比，否则玩家看不出
+## 自己正停在链接上
+var link_hover_color := Color("#ffffff")
+
+## 内联链接的下划线模式，取值 always / never / hover。
+##
+## 直接透传给 RichTextLabel 的 [url underline=...]，所以剧本里不用再包 {u}。
+## hover 是"悬停时才出现下划线"，配合颜色变化，链接感最明确
+var link_underline := "always"
+
 ## 按路径查字体表项。查不到返回空字典 ——
 ## 调用方据此判断"这个路径不在表里"，而不是拿一份默认排版继续跑
 func dialog_font_spec(path: String) -> Dictionary:
 	for entry in dialog_fonts:
 		if String(entry.get("path", "")) == path:
 			return entry
+	return {}
+
+## 按字体路径查正文的排版参数 { "offset_y": float, "line_spacing": int }。
+##
+## 两个来源：
+##   dialog_fonts    简中四体，玩家在设置里能挑的那四种
+##   language_fonts  其它语言的正文默认字体，每门语言只有一档
+##
+## 先查四体表再查语言表，是因为简中下玩家挑的字体可能恰好与语言默认相同，
+## 那时两份表给的排版本来就一致 —— 先查哪一张结果相同，但四体表更具体
+##
+## 查不到返回空字典。调用方（say.gd）据此"只换字体、保持原排版"，
+## 比整段跳过好 —— 那种情况只会出现在字体路径被手改坏的时候
+func dialog_layout(path: String) -> Dictionary:
+	var spec := dialog_font_spec(path)
+	if not spec.is_empty():
+		return {
+			"offset_y": float(spec.get("offset_y", 0.0)),
+			"line_spacing": int(spec.get("line_spacing", 0)),
+		}
+
+	for code in language_fonts:
+		var entry: Dictionary = language_fonts[code]
+		if String(entry.get("dialog", "")) != path:
+			continue
+		return {
+			"offset_y": float(entry.get("offset_y", 0.0)),
+			"line_spacing": int(entry.get("line_spacing", 0)),
+		}
+
 	return {}
 
 ###########################################################

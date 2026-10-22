@@ -141,13 +141,14 @@ signal line_shown(who: String, text: String)
 signal story_ended(ending: String)
 ## 舞台内容变化。带的是深拷后的完整舞台状态 { tag: { attrs, order } }
 signal stage_changed(stage: Dictionary)
-## 舞台被整体重建（热重载、存档恢复）。显示层收到后应当**丢弃所有节点**
-## 并重新构造
+## 舞台被整体重建（热重载、存档恢复）。显示层收到后应当**丢弃所有节点**## 并重新构造
 signal stage_rebuilt()
 ## 进入了一个新的章节（新 label 的第一句台词已经就位）
 signal chapter_started(label_name: String)
-## 执行流经过了某个 label 的入口，且它的第一句台词已经就位
-signal label_entered(label_name: String)
+## 剧本变量变了。玩法侧（成就、HUD 数字）接它，不必每帧轮询
+signal var_changed(path: String, value: Variant)
+## 剧本里的 save 指令。带槽名和指令执行那一刻的进度快照
+signal save_requested(slot: String, state: Dictionary)
 ## 剧本请求舞台转场。转发给显示层（VNStage），由它保存旧画面并执行。
 ## serial 是本次请求的序号，恢复时要原样带回来
 signal stage_transition_requested(transition_name: String, params: Array, serial: int)
@@ -162,6 +163,11 @@ signal qm_auto_hide_changed(on: bool)
 ## 正文字体变了。参数是新的字体路径。
 ## say 界面收到后立刻换字体、并跟着调正文的纵向偏移与行距
 signal dialog_font_changed(path: String)
+## 界面语言变了。参数是新的 locale（已归一成四种语言之一）。
+##
+## 收到之后**当前界面里的文字已经过时了** —— 已经建好的 Label 不会自己
+## 重新翻译。调度器收到这个信号要重建界面，见 main.gd 的 _rebuild_ui()
+signal language_changed(locale: String)
 ## 进入了一条 pause 指令。参数表示它是否在等点击（而不是等秒数）
 signal pause_started(waits_for_click: bool)
 ## 播放器报来一批"接下来大概会用到"的内容。显示层自行决定要不要预载
@@ -196,10 +202,25 @@ func _ready() -> void:
 	get_tree().auto_accept_quit = false
 	get_tree().quit_on_go_back = false
 
+	# 0.5 关掉节点级自动翻译。
+	#
+	# Godot 的 Label / Button 默认会把 text 当成 key 自动查一遍译文。本项目
+	# 不用那套：文案一律由调用方显式 tr()，这样"哪句翻了、哪句没翻"只看
+	# 代码就能回答。自动翻译开着的话，忘了包 tr() 的地方会被悄悄翻掉，
+	# 而看起来一样的两处文字行为不同，排查起来非常难。
+	#
+	# 设在 root 上而不是本节点上：本类是 autoload，与主场景是兄弟关系，
+	# 设在自己身上管不到界面树
+	get_tree().root.auto_translate_mode = Node.AUTO_TRANSLATE_MODE_DISABLED
+
 	# 1. 作品配置必须最先就位：数据目录名、音量分几路都从它取。
 	#    晚一行，下面就会按框架默认值去建目录、读配置
 	VNSettings.load_project_settings()
 	package_path = VNSettings.get_current().package_path
+
+	# 1.5 让"手型"也用项目自己的光标图。必须在任何界面出现之前设好，
+	#     否则第一处 [url] 悬停时仍会闪一下系统小手
+	_unify_cursor_shapes()
 
 	# 2. 玩家数据目录先落地，配置与存档都放它下面
 	VNConfig.ensure_data_dir()
@@ -214,6 +235,11 @@ func _ready() -> void:
 	# 窗口尺寸。必须排在 load_config() 之后 —— 玩家上次选的全屏/窗口、
 	# 以及他自己拖出来的那个大小，都刚从 settings.cfg 里读出来
 	config.apply_display()
+
+	# 3.5 界面语言。必须排在 load_config() 之后（语言在玩家配置里），
+	#     又必须早于任何界面 —— 界面在 _ready() 里就把 tr() 的结果写进
+	#     Label 了，晚一行就会留下半屏旧语言的文字
+	_apply_language(config.resolved_language(), false)
 
 	# 4. 界面转场。自带 CanvasLayer(400)，必须早于任何界面出现
 	transition = VNTransition.new()
@@ -336,8 +362,9 @@ func _bridge_signals() -> void:
 		func(ending: String) -> void: story_ended.emit(ending))
 	player.chapter_started.connect(
 		func(label_name: String) -> void: chapter_started.emit(label_name))
-	player.label_entered.connect(
-		func(label_name: String) -> void: label_entered.emit(label_name))
+	player.save_requested.connect(
+		func(slot: String, state: Dictionary) -> void:
+			save_requested.emit(slot, state))
 	player.stage_transition_requested.connect(
 		func(transition_name: String, params: Array, serial: int) -> void:
 			stage_transition_requested.emit(transition_name, params, serial))
@@ -359,6 +386,10 @@ func _bridge_signals() -> void:
 		func(state: Dictionary) -> void: stage_changed.emit(state))
 	session.stage_rebuilt.connect(
 		func() -> void: stage_rebuilt.emit())
+	# 参数名避开 var_value / has_var 这些转发方法名
+	session.var_changed.connect(
+		func(var_path: String, var_value_now: Variant) -> void:
+			var_changed.emit(var_path, var_value_now))
 
 ## 装开发期钩子。发布版导出排除了 vn/dev/，ResourceLoader.exists 直接为假，
 ## 这里一次函数调用就返回，不会加载任何东西。
@@ -393,6 +424,16 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 ## 推进到下一句台词
 func advance() -> void:
 	player.advance()
+
+## 跳到剧本里的一个 label。由界面在玩家点中台词里的 {jump=} 链接时调用。
+## 目标不存在时播放器只报错并照常往下走，不会中断这一局
+func request_jump(label_name: String) -> void:
+	player.request_jump(label_name)
+
+## 调用剧本里的一个 label，读完回来仍停在点击的那句台词上。
+## 由界面在玩家点中台词里的 {call=} 链接时调用
+func request_call(label_name: String) -> void:
+	player.request_call(label_name)
 
 ## 舞台转场结束。显示层执行完转场后调它，让播放器继续。
 ## serial 对不上时播放器会丢弃这次回调
@@ -455,6 +496,126 @@ func dialog_font() -> String:
 func set_dialog_font(path: String) -> void:
 	config.dialog_font = path
 	dialog_font_changed.emit(config.dialog_font_path())
+
+###########################################################
+#  多语言
+###########################################################
+
+## 当前界面语言（四种语言之一，已归一）。
+##
+## 界面判"现在是不是日文"一律问这里，不要直接读 config.language ——
+## 那个字段可能是空串（玩家从没设置过）
+func language() -> String:
+	return config.resolved_language()
+
+## 切换界面语言。返回"语言是否真的变了"。
+##
+## 已经在这个语言上时只把配置写实（空串 → 显式值），**不广播**：
+## 界面重建是重活，玩家点了当前语言不该让画面闪一下。
+##
+## 真正把新语言铺到屏幕上的是 language_changed 的监听者（调度器），
+## 这里只负责改引擎状态、清字体缓存、通知出去
+func set_language(locale: String) -> bool:
+	var target := VNI18n.normalize(locale)
+	if target == config.resolved_language():
+		config.language = target
+		return false
+
+	config.language = target
+	_apply_language(target, true)
+	return true
+
+## 让"手型"也使用项目自己的光标图。
+##
+## Godot 只给 CURSOR_ARROW 配了 custom_image，别的形状仍会退回系统图 ——
+## RichTextLabel 在 [url] 上返回的手型就是其中之一。项目既然统一用一张
+## 自定义光标，正文里一悬停就冒出个系统小手会很突兀。
+##
+## ── 为什么不覆盖 RichTextLabel 的 _get_cursor_shape ──
+## 那个形状是 RichTextLabel 在 C++ 侧重写 get_cursor_shape() 返回的，
+## GDScript 的虚函数覆盖会被原生实现绕过（实测无效）。改成"让手型形状
+## 也用同一张图"之后，显示上就等于没有手型，而且不碰原生行为
+func _unify_cursor_shapes() -> void:
+	# 键名带 display/ 前缀：project.godot 里它写在 [display] 段下，
+	# 写成裸的 mouse_cursor/... 会 has_setting() 为假，整段静默跳过
+	var path := String(ProjectSettings.get_setting(
+		"display/mouse_cursor/custom_image", ""))
+	if path.is_empty():
+		return
+
+	var image := load(path) as Texture2D
+	if image == null:
+		return
+
+	var hotspot: Vector2 = ProjectSettings.get_setting(
+		"display/mouse_cursor/custom_image_hotspot", Vector2.ZERO)
+	# 只统一真会出现在游戏里的几种形状。全列一遍没意义，
+	# 文本选择那几种本项目根本触发不到
+	for shape in [Input.CURSOR_POINTING_HAND, Input.CURSOR_IBEAM,
+			Input.CURSOR_DRAG, Input.CURSOR_CAN_DROP]:
+		Input.set_custom_mouse_cursor(image, shape, hotspot)
+
+## 把语言应用到引擎并（可选地）广播。
+##
+## 启动与切换共用这一条。两者的差别只在"要不要广播"：
+## 启动时界面还没建出来，广播出去没有监听者，白跑一趟重建逻辑
+##
+## 顺序是刻意的：
+##   1. 清字体缓存 —— 旧语言的 Font 对象要先断引用，后面才会真的释放
+##   2. set_locale  —— 之后所有的 tr() 才是新语言
+##   3. 补发 dialog_font_changed —— 正文字体通常跟着语言变，先说字体，
+##      下面那次重译才是用新字体画出来的
+##   4. 重译当前句 —— 停留在对话框上的那句要跟着变
+##   5. 广播 language_changed —— 界面层据此重建
+func _apply_language(locale: String, notify: bool) -> void:
+	# 把归一后的值写回配置。启动时 config.language 可能是空串（玩家从没
+	# 设置过），写实之后 save_config() 落盘的就是规范值，而不是空串 ——
+	# 空串虽然也能被 resolved_language() 兜住，但打开 settings.cfg 看时
+	# 分不清"没设置过"和"设置成了默认值"
+	config.language = VNI18n.normalize(locale)
+
+	VNI18n.clear_font_cache()
+	VNI18n.apply(locale)
+
+	# 自检放在 set_locale 之后：这时 get_loaded_locales() 反映的是
+	# 引擎真正加载了什么，而不是 project.godot 里写了什么
+	_check_translations()
+
+	if not notify:
+		return
+
+	dialog_font_changed.emit(config.dialog_font_path())
+	if player != null:
+		player.retranslate_current()
+	language_changed.emit(config.resolved_language())
+
+## 启动自检：除了源语言，每个声明过的语言都该有一份**文件存在且已登记**的翻译表。
+##
+## 只警告、不中断。少一份译文仍然能玩（整片回退简中），但那是
+## "文件没放对"或"project.godot 的 translations 列表漏登记"的典型症状，
+## 而这两种情况都不会在别处留下任何痕迹。
+##
+## ── 为什么不看 get_loaded_locales() ──
+## 繁中表在简中界面下会被主动摘掉（见 VNI18n.apply），那一刻它不在
+## "已加载"列表里。用加载状态判断会把这种正常状态误报成故障。
+## 所以这里查两件与运行时状态无关的事：文件在不在、登记过没有
+func _check_translations() -> void:
+	var registered: PackedStringArray = ProjectSettings.get_setting(
+		"internationalization/locale/translations", PackedStringArray())
+
+	for entry: Dictionary in VNI18n.languages():
+		var code := String(entry.get("locale", ""))
+		if code.is_empty() or code == VNI18n.source_language():
+			continue
+
+		var path := VNI18n.translation_dir().path_join(code).path_join("ui.po")
+		if not ResourceLoader.exists(path):
+			push_warning("VNI18n：%s 没有译文文件，将整片回退简中：%s"
+				% [code, path])
+			continue
+		if not registered.has(path):
+			push_warning(("VNI18n：%s 的译文没有登记到 project.godot 的 "
+				+ "internationalization/locale/translations：%s") % [code, path])
 
 ## 同步快进状态。say 界面在开关快进时调用，快进时框架跳过转场与窗口动画
 func set_skipping(on: bool) -> void:
@@ -557,6 +718,27 @@ func is_image_seen(id: String) -> bool:
 ## 对话历史。返回实例本身，界面只读
 func history() -> VNHistory:
 	return session.history()
+
+## 把文本里的 [变量] 换成当前值。查不到的名字原样留着。
+##
+## 显示层拿到译文之后调它 —— 台词、历史行、存档附言三处都要过一遍。
+## 放在 tr() 之后是有意的：译文里同样可以写占位符
+func interpolate(text: String) -> String:
+	return session.interpolate(text)
+
+## 读一个剧本变量。路径没声明或还没赋值时返回 null ——
+## 变量不存 null，所以 null 一定表示"没有"
+func get_var(path: String) -> Variant:
+	return session.var_value(path)
+
+## 变量在不在
+func has_var(path: String) -> bool:
+	return session.has_var(path)
+
+## 玩法侧写变量。路径必须是剧本里 default 声明过的，否则拒绝并报错。
+## 走的是和剧本 set 完全相同的赋值路径
+func set_var(path: String, value: Variant) -> bool:
+	return player.set_var(path, value)
 
 ###########################################################
 #  音频（转发到 Audio）

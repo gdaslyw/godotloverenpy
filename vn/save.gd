@@ -17,13 +17,12 @@ extends RefCounted
 #  算出来的（见 slot_display_number）：
 #    手动槽   "1-1" … "1-50"   对应原项目 page "1" 的 50 个槽
 #    自动档   "auto"           对应 Ren'Py 的 auto 页
-#    流程图档 "fc-<label>"     对应原项目 page "fc"，一个 label 一个槽
+#    固定槽   任意名字          由内容层自己写，框架不预置也不自动填
 #
-#  流程图档这一行要展开说：原项目读它的写法是 FileTime("ep0_1", page="fc")，
-#  而 Ren'Py 的文件名就是"页-槽"用连字符拼起来的，落盘叫 fc-ep0_1 ——
-#  与这里的拼法逐字相同。"fc" 是 flowchart 的缩写。
-#  哪些 label 该存它由**内容层**的名单决定（见 chapters.gd 的 FLOWCHART），
-#  这里只认拼法，不认名单
+#  固定槽不是框架概念：槽名只是内容层写死的一个字符串，框架只保证
+#  "任意槽名都能读写" —— 名字里带连字符、下划线、中文都没有关系。
+#  什么时候往它里面写由内容层自己决定，框架没有"经过某个 label 就自动
+#  存一份"的功能
 #
 #  界面上还有一条"最近存档"，它**不是一个槽**，而是"手动槽里最新的
 #  那一个"的查询结果，所以没有对应的文件名。
@@ -90,10 +89,6 @@ const MANUAL_PAGE := "1"
 
 ## 自动存档的槽名
 const SLOT_AUTO := "auto"
-
-## 流程图档的槽名前缀。对应原项目 page "fc" —— page + slot 拼出来的文件名
-## 与 Ren'Py 逐字相同，所以这里必须是连字符
-const FLOWCHART_PREFIX := "fc-"
 
 ## 存档格式版本。布局或数据结构改动时 +1，读档时会挡住旧档并给出
 ## 明确提示，而不是让缺字段的字典悄悄跑下去
@@ -197,6 +192,20 @@ const F_BGM := "bgm"
 ## 不存这一份的话，读档重建只能从第 0 帧重播 —— 立绘会跳回居中。
 ## 旧存档没有这个字段，读出来是空字典，行为退回"重建 + 重播"
 const F_POSE := "pose"
+## 存档字段名：舞台结构快照（谁在台上、什么形态、哪一层）。
+##
+## 与 F_POSE 分工：【这里是"有哪些 tag"，F_POSE 是"它们现在在哪"】。
+## 读档拿它直接还原舞台，不再从会话入口重放指令流 —— 重放要求控制流
+## 完全可复现，而 {call=} 这类由玩家点击产生的位置变更重放看不见，
+## 存档在它内部时重放会跑飞。
+##
+## 旧存档没有这个字段，读出来是空字典，行为退回"重放重建"
+const F_STAGE := "stage"
+## 存档字段名：剧本变量表。
+##
+## 它是 body 而不是 meta：变量可能很多，存档列表用不上。
+## 旧存档没有这个字段，读出来是空字典 —— 之后剧本里再执行 "+=" 就从零值起算
+const F_VARS := "vars"
 ## 存档字段名：缩略图（924x520 的 PNG 字节）
 const F_THUMB := "thumb"
 
@@ -208,7 +217,7 @@ const META_FIELDS := [
 ]
 
 ## body 块收录哪些字段
-const BODY_FIELDS := [F_ROLES, F_HISTORY, F_BGM, F_POSE]
+const BODY_FIELDS := [F_ROLES, F_HISTORY, F_BGM, F_POSE, F_STAGE, F_VARS]
 
 ###########################################################
 #  槽名与路径
@@ -225,14 +234,6 @@ static func manual_slots() -> PackedStringArray:
 		out.append(manual_slot(i))
 	return out
 
-## 某个 label 的流程图档槽名。
-##
-## 一个 label 一个槽，所以不像手动槽那样需要页内编号 —— 槽名直接用 label 名，
-## 与原项目 page "fc" 的槽 "ep0_1" 拼出来的完全一致。
-## **要不要存**由内容层的名单决定，这个函数只管拼，不管名单
-static func flowchart_slot(label_name: String) -> String:
-	return FLOWCHART_PREFIX + label_name
-
 ## 槽名对应的界面编号文本。"1-7" → "07"。
 ##
 ## 原项目是 str(slot).replace("1-", "").zfill(2)，这里照抄意图但换了实现：
@@ -242,13 +243,12 @@ static func flowchart_slot(label_name: String) -> String:
 ## ── 为什么没有了针对序章槽的 "00" 特判 ──
 ## 那条特判把两件事捆在一起：槽叫什么（内容层的）和显示成几号（界面约定）。
 ## 而原项目根本没有它 —— 序章那一格是**整块手写**的
-## （game/screen/save_load.rpy:112-141：槽名 "ep0_1"、页名 "fc"、
-## 编号 "NO.00" 全是字面量），压根不走编号解析。
+## （game/screen/save_load.rpy:112-141：槽名、页名、编号全是字面量），
+## 压根不走编号解析。
 ##
 ## 编号现在由内容层的存档界面自己给，见 save_load.gd 的 _slot_number()。
-## 顺带记一笔：移掉特判之后，"fc-ep0_1" 走下面这段会因为 int("ep0_1")
-## 失败返回 0 而凑出 "00" —— 那是巧合，不是约定，所以内容层不能省掉
-## 自己那一手
+## 内容层那个固定槽叫 "fc-ep0_1"，走下面这段会 int("ep0_1") 失败返回 0，
+## 凑出 "00" —— 那是巧合，界面不能依赖它
 static func slot_display_number(slot: String) -> String:
 	var dash := slot.find("-")
 	if dash < 0:

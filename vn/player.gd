@@ -62,21 +62,15 @@ signal story_ended(ending: String)
 ## 才重绘完。应用层要抓缩略图的话得再等一帧，见那边的自动存档流程。
 signal chapter_started(label_name: String)
 
-## 执行流经过了某个 label 的入口，且它的第一句台词已经就位。
+## 剧本里的 save 指令。参数是槽名与**指令执行那一刻**的进度快照。
 ##
-## 与上面那条的区别就一句话：**chapter_started 判的是"label 名变了"，
-## 这条判的是"label 指令真的被执行到了"**。所以要分成两条信号。
+## 快照在这里取而不是让应用层到帧末自己抓：save 后面常常紧跟 jump / call，
+## 它们会立刻改 _cursor —— 等到帧末再取，存下来的位置已经是好几条之后了。
+## 这也正是 Ren'Py 的语义：renpy.save() 存的是它执行到的位置。
 ##
-## 为什么非要分开：读档是把游标直接放到某句台词上（见 restore_position），
-## 途中根本不经过 label 指令。章节固定存档点若按"label 名变了"来判，玩家在
-## 第一章里读一份序章中段的档，就会被误判成"进了序章"，把这个固定档覆盖成
-## 中段的内容。Ren'Py 没有这个问题 —— $ renpy.save(...) 是一行会被执行到的
-## 语句，jump 进 label 中间压根不经过它。
-##
-## 反过来说，这条信号**不去重**：jump 回同一个 label 算重新进入，与"那行
-## 语句又执行了一次"一致。而那正是 chapter_started 要挡掉的情况，两条信号
-## 的判据在这里正好相反
-signal label_entered(label_name: String)
+## 应用层收到后负责抓缩略图与落盘，播放器不等它 —— 存档是异步的，
+## 指令本身不产生台词、不停顿、不碰舞台
+signal save_requested(slot: String, state: Dictionary)
 
 ## 剧本请求一次舞台转场。参数是转场名、它的参数（不含名字）与本次请求的序号。
 ##
@@ -187,13 +181,6 @@ var _voice_owner := ""
 ## 都会重新经过 label 指令，但那些都不是"进入了新章节"
 var _last_announced_label := ""
 
-## "刚经过 label 入口，还没报出去"。见 label_entered 信号。
-##
-## 由 advance() 的 label 分支置位、由 _show_current() 消费，中间隔着若干条
-## 非显示指令（set / show / scene …）。之所以用一个标量带过去而不是就地发信号：
-## 经过入口的那一刻画面还停在上一句，应用层要抓缩略图得等台词出来才有的抓
-var _label_fresh := false
-
 ## 是否停在 with_run 上等舞台转场。
 ##
 ## 等待期间 advance() 直接返回：自动播放、快进、玩家点击都会走到 advance()，
@@ -246,6 +233,30 @@ var _pause_wait_tag := ""
 var _pending_wait := 0.0
 ## 上面那次等待对应哪个 tag。跳过时用它找到动画去结算
 var _pending_wait_tag := ""
+
+## 待生效的内联跳转，存目标 label 名。空串表示没有。
+##
+## 由台词里的 {jump=} / {call=} 点击写进来，消费点与 _pending_wait 在同一个
+## 循环顶。不就地改 _cursor 是因为玩家点链接发生在 GUI 事件里，那时播放器
+## 正等着下一次推进 —— 把跳转排进"下一条指令"，语义就和剧本里的一条
+## jump 完全等价，不用为它单独维护一条执行路径
+var _pending_jump := ""
+## 上面那次内联跳转是不是 call。true 表示读完目标 label 还要回到触发它的那句。
+##
+## 两个标签共用 _pending_jump 存目标名，只用这个开关区分 —— 目标名、校验、
+## "目标不存在就报错并照常推进"那几段完全一样，没有第二个字段的必要
+var _pending_call := false
+
+## 玩家点过 {jump=} 的位置，每项 { sid, target }。
+##
+## 重放要靠它复现"那一次偏离主线"。{call=} 不用记在这里 —— 它压的栈帧
+## 里有 target，重放从调用栈取；{jump=} 不压栈，跳完什么都不剩，
+## 不自己记一份就永远还原不出来。
+##
+## **只增不减**：一条记录产生后一直有效，重放按 sid 查找。同一条台词
+## 点两次只是重复同一个跳转，不必区分先后。换位置（start / 读档）时
+## 跟着位置快照一起清空或覆盖
+var _inline_jumps: Array[Dictionary] = []
 
 ###########################################################
 #  装配
@@ -314,6 +325,9 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 		# 章节切换不该把读过的东西抹掉；而 NEW_GAME 是重开一局，
 		# 上一局的历史留到这一局里就是串台
 		session.clear_history()
+		# 变量同理，但要走 default 表：先清空，再按声明灌初值。
+		# 上一局没被声明过的量不该带着数跑进新局
+		session.reset_vars(story.defaults)
 
 	_label_name = label_name
 	_label_begin = begin
@@ -321,12 +335,12 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 	# 才能得到正确的路径 —— 见 rebuild_stage()
 	_session_label = label_name
 	_call_stack.clear()
+	# 上一局点过的内联跳转不能带到新的一局：重放按 sid 匹配，
+	# 而 sid 在同一份剧本里是固定的，留着会让新的一局凭空偏离主线
+	_inline_jumps.clear()
 	# 章节报告重新计数：新的一局从入口 label 重新开始，
 	# 即便入口和上一局的最后一章同名，也该再报一次
 	_last_announced_label = ""
-	# 入口标记同理。下一轮 advance() 一定会经过 label 指令重新置位，
-	# 这里清掉是为了让上一局遗留的 true 不可能漏进这一局
-	_label_fresh = false
 	# 上一局若停在转场里，新的一局不该继承这个等待状态
 	_waiting_transition = false
 	# 窗口状态每局重来：auto 恢复成作品配置，界面还没画面时窗口是藏着的
@@ -383,6 +397,32 @@ func advance() -> void:
 				_start_pause({"args": [str(wait_seconds)]}, wait_tag)
 				return
 
+		# 内联跳转：玩家点了台词里的 {jump=} / {call=} 链接。
+		# 放在 _cursor += 1 之前，等价于"在当前句后面插了一条 jump / call"；
+		# 目标不存在时只报错并继续往下走，不让玩家端结束 ——
+		# 因为这一下是玩家点出来的，卡在原地比走错更难受
+		if not _pending_jump.is_empty():
+			var jump_name := _pending_jump
+			var is_call := _pending_call
+			_pending_jump = ""
+			_pending_call = false
+			var jump_target := story.label_start(jump_name)
+			if jump_target < 0:
+				push_error("内联跳转的目标不存在：%s" % jump_name)
+			elif is_call and not _push_text_call(jump_name):
+				# 栈太深。当作普通推进：这一次点击被吃掉，不跳
+				push_error("内联 call 的嵌套层数已达上限，已改为普通推进")
+			else:
+				if not is_call:
+					# 只有 {jump=} 要记：call 的目标在栈帧里，而 jump 跳完
+					# 什么都不剩，重放没有别的来源
+					_inline_jumps.append({
+						"sid": current_sid(),
+						"target": jump_name,
+					})
+				_cursor = jump_target - 1
+				continue
+
 		_cursor += 1
 		if _cursor >= story.ops.size():
 			# 语法层已保证每个 label 都以 jump / finish / return 收尾，
@@ -413,13 +453,13 @@ func advance() -> void:
 			if label_args.size() > 0:
 				_label_name = String(label_args[0])
 			_label_begin = _cursor
-			# 标记"这次是从章节入口进来的"。**只在这里置位**，别处一律不置 ——
-			# 读档与热重载都是先改 _cursor 再调 advance()，走不到这一支，
-			# 于是"从中间恢复"天然不会被误报成入口
-			_label_fresh = true
 			continue
 
+		# 变量赋值。读档恢复时跳过 —— 变量随存档整份还原了，再从
+		# 入口重放一遍 "+=" 就会把值算多。与 save 指令同一个理由
 		if kind == "set":
+			if _restoring:
+				continue
 			_apply_set(op)
 			continue
 
@@ -459,6 +499,17 @@ func advance() -> void:
 
 		if kind == "stop_sound":
 			_apply_stop_sound(op)
+			continue
+
+		# 存档。和音频那几条同一类：不产生台词、不停顿、不碰舞台。
+		# 只挡重放 —— 读档恢复会把剧本从头走一遍，那不是玩家在存档，
+		# 不挡的话一次读档就可能把存档点覆盖掉。
+		# 快进照常执行：快进只是玩家跳着读，路是走过了的，
+		# 作者用 save 标出的节点（流程图档靠它）一个都不能少
+		if kind == "save":
+			if _restoring:
+				continue
+			_apply_save(op)
 			continue
 
 		if kind == "scene":
@@ -556,6 +607,28 @@ func advance() -> void:
 			return
 
 	_show_current()
+
+## 请求一次内联跳转。由界面在玩家点中台词里的 {jump=} 链接时调用。
+##
+## 真正的跳转发生在 advance() 的循环顶：这里只登记目标，然后当成一次
+## 普通推进 —— 玩家点链接本来就是"往下走"这个动作，不该和点击分两套路径
+func request_jump(label_name: String) -> void:
+	if not _playing:
+		return
+	_pending_jump = label_name
+	_pending_call = false
+	advance()
+
+## 请求一次内联调用。由界面在玩家点中台词里的 {call=} 链接时调用。
+##
+## 与 request_jump 共用一条登记通道，差别只在消费时压不压调用栈：
+## call 的目标走到 return 会回到**触发它的那一句**，也就是玩家点的那句台词
+func request_call(label_name: String) -> void:
+	if not _playing:
+		return
+	_pending_jump = label_name
+	_pending_call = true
+	advance()
 
 ## 是否还在播放
 func is_playing() -> bool:
@@ -661,6 +734,7 @@ func capture_position() -> Dictionary:
 		"cursor": _cursor,
 		"label_name": _label_name,
 		"call_stack": _call_stack.duplicate(true),
+		"inline_jumps": _inline_jumps.duplicate(true),
 		"session_label": _session_label,
 		"path": package_path,
 	}
@@ -672,14 +746,21 @@ func capture_position() -> Dictionary:
 ##
 ## poses 是存档里那份各 tag 的显示姿态。读档时传进来，重建出来的节点
 ## 才能停在存档那一刻的位置上；热重载不传，走显示层自己的"销毁前抓一份"那条路
-func restore_position(snapshot: Dictionary, poses: Dictionary = {}) -> void:
+##
+## stage_snapshot 是存档里那份舞台结构。给了就用它直接还原，没给才重放
+## 指令流。三个调用方的取舍：
+##   读档     → 有结构快照，用它（精确，且不受 {call=} 这类点击跳转影响）
+##   历史跳转 → 历史条目只记了姿态，没有结构，只能重放
+##   热重载   → 没有快照，且剧本刚改过，本来就该按新指令重算
+##
+## 历史条目不带结构是有意的：一条历史存一份舞台会让存档里几百条各带几 KB，
+## 而回跳的绝大多数落点都在主线上，重放得出来。回跳到 {call=} 子剧情
+## 内部的那一条同样能走对 —— 目标从恢复出来的调用栈里取，见 rebuild_stage()
+func restore_position(snapshot: Dictionary, poses: Dictionary = {},
+		stage_snapshot: Dictionary = {}) -> void:
 	if not _check_ready():
 		return
 
-	# 这是一次"跳到中间"，不是"从入口进来"。清标记的理由见 label_entered 信号。
-	# 放在最前面而不是交给 advance()：中途若正好停在 label 指令上，
-	# advance() 反而会把它置起来，先清才能保证语义是"这次不算"
-	_label_fresh = false
 	# 读档是彻底换一个位置，上一处若停在转场里，这个等待必须作废
 	_waiting_transition = false
 	# pause 同理：上一处若停在等待里，新位置不该继承它
@@ -712,6 +793,14 @@ func restore_position(snapshot: Dictionary, poses: Dictionary = {}) -> void:
 		if frame is Dictionary:
 			_call_stack.append((frame as Dictionary).duplicate(true))
 
+	# 内联跳转记录。旧快照没有这一项，空数组等价于"这一路没点过链接"——
+	# 那种情况下重放本来就走主线，与旧版本行为一致
+	_inline_jumps.clear()
+	var hops: Array = snapshot.get("inline_jumps", [])
+	for hop in hops:
+		if hop is Dictionary:
+			_inline_jumps.append((hop as Dictionary).duplicate(true))
+
 	_playing = true
 	# 恢复途中遇到 with_run 直接跳过。读档是定位，不是播放
 	_restoring = true
@@ -722,10 +811,15 @@ func restore_position(snapshot: Dictionary, poses: Dictionary = {}) -> void:
 	# 从一句台词直接恢复时它不会经过 label，所以这里补一次同步
 	_sync_label_at_cursor()
 
-	# 舞台按**新**指令流重建。位置对了不等于画面对了 ——
-	# 剧本里改过的 show / hide 只有重放一遍才会反映到屏幕上；
-	# 而"重放到一半的动画"只有 pose 能还原
-	rebuild_stage(poses)
+	# 舞台。有结构快照就照它还原，否则按新指令流重放。
+	#
+	# 位置对了不等于画面对了 —— 剧本里改过的 show / hide 只有重放一遍才会
+	# 反映到屏幕上；而"重放到一半的动画"只有 pose 能还原。
+	# 所以两条路都以"结构 + 姿态"收尾，只是结构从哪来不同
+	if stage_snapshot.is_empty():
+		rebuild_stage(poses)
+	else:
+		session.restore_stage(stage_snapshot, poses)
 
 ## 从磁盘重新读一遍剧本包。
 ## 调用方负责在此之前取好位置快照，之后用 restore_position() 放回去
@@ -746,20 +840,29 @@ func reload_story() -> bool:
 ## 键名全部取自 VNSave.F_* —— 存与读共用一套常量，不会出现
 ## "写的时候叫 A、读的时候叫 B"这种只在读档时才暴露的错
 ##
-## ── 为什么没有舞台 ──
-## 舞台不存。restore_position() 会调 rebuild_stage()，从会话入口重放到
-## 当前游标，结果等价于存档时的舞台 —— 而且**必然与当前剧本一致**。
-## 存一份下来的话，剧本改过之后就会出现"存档里的舞台"与"重建出来的
-## 舞台"两个版本，还得决定听谁的
+## ── 舞台为什么要存 ──
+## 早先不存，靠 restore_position() 从会话入口重放指令流重建。那个办法要求
+## 控制流完全由指令决定，而 {call=} 是玩家点出来的：它不是一条 call 指令，
+## 重放走到那里看不见，存档停在它内部时重放会一路跑到剧本末尾，
+## 把整份剧本的 show / scene 全应用一遍 —— 舞台变成结局态，比不重建更糟。
+##
+## 代价是存档记的是"那一刻的画面"：之后删掉某个角色再读旧档，那个立绘
+## 还会出现。它与 Ren'Py 存 scene_lists 是同一个取舍 —— 存档是一份快照，
+## 不是一份可以按新剧本重新演算的剧本。
+##
+## F_STAGE 存结构（谁在台上），F_POSE 存姿态（他们在哪）：
+## 前者指令里没有，后者只有那一帧才有，两样都得留下来
 func capture_state() -> Dictionary:
 	return {
 		VNSave.F_POSITION: capture_position(),
 		VNSave.F_SID: current_sid(),
 		VNSave.F_ANCHORS: VNPosition.anchors_from(story.ops, _cursor),
 		VNSave.F_ROLES: session.roles_data(),
+		VNSave.F_STAGE: session.stage(),
 		VNSave.F_HISTORY: session.history_data(),
+		VNSave.F_VARS: session.vars_data(),
 		VNSave.F_BGM: audio.current_bgm(),
-		VNSave.F_WHAT: session.last_say_text(),
+		VNSave.F_WHAT: session.interpolate(tr(session.last_say_text())),
 		VNSave.F_POSE: session.stage_poses(),
 	}
 
@@ -793,7 +896,12 @@ func restore_state(data: Dictionary) -> bool:
 		Callable(story, "label_start"))
 	match String(moved.get("how", "")):
 		VNPosition.HOW_ANCHOR:
-			push_warning("读档：这一句在当前剧本里已被改写，按上下文就近恢复")
+			# sid 还在、只是那条指令不是台词 —— 剧本里写的流程存档点
+			# （ep0.vns 的 save "fc-ep0_1" 那种）就属于这一类：存档时游标
+			# 停在 save 上，锚点算出来的位置与存档时完全一致，落点是精确的。
+			# 只有 sid 真的不在了才是"这句被改写"，那时落点是估出来的
+			if not bool(moved.get("sid_found", false)):
+				push_warning("读档：这一句在当前剧本里已被改写，按上下文就近恢复")
 		VNPosition.HOW_LABEL, VNPosition.HOW_STACK:
 			push_warning("读档：这一句在当前剧本里找不到了，已退回章节开头")
 
@@ -804,10 +912,17 @@ func restore_state(data: Dictionary) -> bool:
 	# 才挡得住这次重复追加。反过来的话，读档后历史末尾会多出一条一模一样的
 	session.restore_roles(data.get(VNSave.F_ROLES, {}))
 	session.restore_history(data.get(VNSave.F_HISTORY, []))
+	# 变量必须在 restore_position() 之前就位：它内部 advance() 会走到下一句，
+	# 途中的 show 之类不读变量，但剧本随时可能用 [变量] 插值 ——
+	# 而且 rebuild_stage() 已经不重放 set 了，这里是唯一的值来源
+	session.restore_vars(data.get(VNSave.F_VARS, {}))
 
 	# 舞台姿态。旧存档里没有这一项，空字典会让重建退回"居中 + 重播"
 	var poses: Dictionary = data.get(VNSave.F_POSE, {})
-	restore_position(moved, poses)
+	# 舞台结构。旧存档里没有这一项，空字典会让 restore_position() 退回
+	# "重放指令流"那条老路 —— 存档在 {call=} 内部时那条路会跑飞，
+	# 但那时也只能如此，总比一片空白好
+	restore_position(moved, poses, data.get(VNSave.F_STAGE, {}))
 
 	# ── 音乐 ──
 	#
@@ -922,12 +1037,19 @@ func end_session() -> void:
 ##
 ## 起点用 label 名而不是下标：指令下标在重编译后会失效，label 名不会。
 ##
-## set 一并重放，但**不**调 session.reset_roles()：set 是赋值、幂等的，
-## 重放一遍结果相同；而 reset_roles() 会把属性打回 define_role() 的初始值，
-## 那会毁掉 StartMode.CONTINUE 带过来的跨章节状态
+## set **不**重放：变量是随存档整份还原的（VNPlayer.restore_state 里先于
+## 定位就位），重放一遍 "+="/"-=" 就会把值算多。同理也不调
+## session.reset_roles() —— 那会把属性打回 define_role() 的初始值，
+## 毁掉 StartMode.CONTINUE 带过来的跨章节状态
 ##
 ## 舞台状态写进 session，重放的循环控制留在本类 —— 两边各管一段：
 ## session 不知道剧本存在，本类不直接碰 _stage 那份字典
+##
+## ── {call=} 也要重放 ──
+## 它的目标只存在于调用栈里（玩家点出来的，指令流里没有）。而历史跳转
+## 不带舞台结构快照 —— 历史条目一条存一份舞台会让存档胖几百 KB ——
+## 所以回跳到子剧情里的某一句，只能靠重放把那次调用复现出来。
+## 复现的信息全部来自栈帧：sid 认出触发句，target 指出跳去哪
 func rebuild_stage(poses: Dictionary = {}) -> void:
 	if _cursor < 0 or story.ops.is_empty():
 		return
@@ -944,6 +1066,17 @@ func rebuild_stage(poses: Dictionary = {}) -> void:
 			pc = entry
 
 	var returns: Array[int] = []
+	# 台词里的 {call=} 压的帧，按栈序排列。
+	#
+	# 这类调用没有对应的 call 指令 —— 目标是玩家点出来的，只存在于栈帧里。
+	# 重放要复现它，只能从这里取目标。按顺序消费而不是"按 sid 查找"：
+	# 同一条台词被点两次就压两帧，查找到的永远是第一帧，重放会一直在
+	# 第一次调用的子剧情里打转
+	var text_calls: Array[Dictionary] = []
+	for frame in _call_stack:
+		if frame.has("target"):
+			text_calls.append(frame)
+	var next_text_call := 0
 	# 步数上限。剧本里写得出跳转环，没有上限时重建会卡死在这里 ——
 	# 而它是在热重载路径上跑的，卡死等于游戏没反应。取指令总数两倍：
 	# 正常路径每条最多经过两遍（进去、回来）
@@ -957,9 +1090,38 @@ func rebuild_stage(poses: Dictionary = {}) -> void:
 		budget -= 1
 
 		var op: Dictionary = story.ops[pc]
-		match String(op["op"]):
-			"set":
-				_apply_set(op)
+		var op_kind := String(op["op"])
+
+		# 这台词是不是某次内联跳转的触发句。命中就照真实执行那样偏离主线，
+		# 否则重放会沿着主线一路走下去，永远到不了点过链接才去的地方。
+		#
+		# jump 与 call 分开查：前者跳过目标就不回来了，不压栈；
+		# 后者要压一层返回地址，落点由调用栈帧给出
+		if op_kind == "say" or op_kind == "say_literal":
+			var op_sid := int(op.get("sid", 0))
+
+			var hop := _find_inline_jump(op_sid)
+			if not hop.is_empty():
+				var hop_to := story.label_start(String(hop.get("target", "")))
+				if hop_to >= 0:
+					pc = hop_to
+					continue
+
+			if next_text_call < text_calls.size():
+				var text_frame: Dictionary = text_calls[next_text_call]
+				if int(text_frame.get("sid", 0)) == op_sid:
+					next_text_call += 1
+					var text_to := story.label_start(
+						String(text_frame.get("target", "")))
+					if text_to >= 0:
+						# 落点用帧里记的那个数（就是这条 say 的下标），
+						# 不用 pc —— 两者必须相等，而拿帧里的值才能保证
+						# _stack_matches() 比的是同一样东西
+						returns.append(int(text_frame.get("return_index", 0)))
+						pc = text_to
+						continue
+
+		match op_kind:
 			"show":
 				_apply_show(op, false)
 			"show_front":
@@ -1001,9 +1163,14 @@ func rebuild_stage(poses: Dictionary = {}) -> void:
 
 	if not reached:
 		# 走到这里说明入口 label + 控制流推不出当前游标。位置恢复那一层
-		# 已经尽力了，舞台这边如实说一声，别让屏幕上摆着一份来路不明的状态
+		# 已经尽力了，舞台这边如实说一声。
+		#
+		# 清空而不是留着：循环跑到预算耗尽时，_stage 里装的是"整份剧本
+		# 一路 show 到末尾"的结果，那是错的画面。空舞台至少一眼看得出
+		# "重建失败了"，错乱的立绘反而会被当成剧本问题去查
 		push_warning("舞台重建没能走到当前位置（label \"%s\"，游标 %d），"
-			% [_session_label, _cursor] + "屏幕上的内容可能不完整")
+			% [_session_label, _cursor] + "已清空舞台")
+		session.clear_stage()
 
 ## 重放途中维护的返回地址栈，是否就是当前位置的调用栈。
 ##
@@ -1016,6 +1183,11 @@ func rebuild_stage(poses: Dictionary = {}) -> void:
 ## 调用栈正是"第几次进来"的区分信息。两边存的还是同一样东西：
 ## _call_stack 每帧的 return_index 就是 call 的下一条指令，
 ## 而重放压栈压的也是 pc + 1
+##
+## ── text call 的帧也在这张表里 ──
+## {call=} 压的帧同样带 return_index（记的是触发它的那条 say 的下标），
+## 重放用帧里的值往 returns 里压，所以两边比的仍然是同一样东西。
+## 读档不走重放（存档有 F_STAGE 舞台快照），这条比对留给热重载与历史跳转
 func _stack_matches(returns: Array[int]) -> bool:
 	if returns.size() != _call_stack.size():
 		return false
@@ -1043,6 +1215,19 @@ func _target_name(op: Dictionary) -> String:
 	var args: Array = op["args"]
 	return String(args[0]) if args.size() > 0 else "<空>"
 
+## 从内联跳转记录里找出这条台词点过一次的那一条。没有则返回空字典。
+##
+## 同一条台词点两次 {jump=} 只是重复同一个跳转 —— 第一次跳走之后就不会
+## 再回到那条台词，所以取第一条即可，不必区分先后。
+## sid 为 0 直接当作"没有"：那是没分配 sid 的指令，匹配它只会误伤
+func _find_inline_jump(sid: int) -> Dictionary:
+	if sid == 0:
+		return {}
+	for hop in _inline_jumps:
+		if int(hop.get("sid", 0)) == sid:
+			return hop
+	return {}
+
 ## 压一层调用栈并跳到目标 label。栈太深或目标不存在时返回 false，由调用方收尾。
 ##
 ## 栈帧存的是 call 指令自己的 sid，不是目标 label 的名字：位置快照要在
@@ -1068,7 +1253,34 @@ func _enter_call(op: Dictionary) -> bool:
 	_cursor = target - 1
 	return true
 
-## 弹一层调用栈并回到 call 的下一条。栈空时返回 false。
+## 压一层"台词里的 call"栈帧。目标 label 由调用方负责跳过去。
+##
+## 与 _enter_call 的两点差别：
+##   · return_index 记的是**当前这一句**，不是它的下一条 —— 这是 Ren'Py
+##     from_current 的语义：读完目标 label 回来，玩家还停在这句台词上，
+##     于是这句会重新显示一次（打字机重打、语音重播、历史可能多一条）。
+##     Ren'Py 文档对这个开关的说明就是 "the current statement being run twice"
+##   · sid 记的是这句台词的 sid：调用栈靠它在新旧指令流里认出"是同一句"
+##
+## 目标 label 若不以 return 收尾，这一帧会一直留在栈上 —— 编译期查不出
+## （要跨 label 做控制流分析），与 Ren'Py 一样把这条当作者责任
+func _push_text_call(label_name: String) -> bool:
+	if _call_stack.size() >= MAX_CALL_DEPTH:
+		return false
+
+	_call_stack.append({
+		"sid": current_sid(),
+		"return_index": _cursor,
+		"label_name": _label_name,
+		"label_begin": _label_begin,
+		"target": label_name,
+	})
+	return true
+
+## 弹一层调用栈并回到帧里记的落点。栈空时返回 false。
+##
+## 落点由压栈方决定：call 指令记的是"它的下一条"，台词里的 {call=} 记的是
+## "触发它的那一句"（Ren'Py 的 from_current）。这里只负责照做，不区分来源。
 ##
 ## label 名和 label 起始下标一并恢复：return 落回的位置通常不是 label 指令，
 ## 靠往回搜是搜不准的 —— call 的下一条可能紧挨着另一个 label 的边界
@@ -1092,23 +1304,50 @@ func _leave_call() -> bool:
 ###########################################################
 
 ## 执行一条 set 指令。
-## 路径形状已经由 parser 校验过，这里是运行时的落点。
-## set 是静默指令，不产出台词，执行完继续往下走
+##
+## args 布局（编译期钉死）：[0] 路径  [1] 类型  [2] 值的字面形式  [3] 运算符
+## 类型是 s / i / f / b 之一 —— .vnbc 的参数只有字符串，不带着它
+## 3 和 "3" 就分不开
+##
+## 路径首段是 role 时是角色属性，值是字符串、只接受 "="；
+## 其余一律是普通变量，走 VNSession 的变量表
 func _apply_set(op: Dictionary) -> void:
 	var args: Array = op["args"]
-	if args.size() < 2:
+	if args.size() < 4:
+		push_error("set 指令的参数不完整：%s" % str(args))
 		return
 
 	var path := String(args[0])
-	var value := String(args[1])
+	var value: Variant = VNSession.decode_value(String(args[1]), String(args[2]))
+	var how := String(args[3])
 
-	# parser 保证路径是 role.<角色>.<属性> 三段
-	var segments := path.split(".")
-	if segments.size() != 3 or segments[0] != "role":
-		push_error("set 的路径形状不对：%s" % path)
+	if path.begins_with(VNSession.ROLE_PATH_ROOT + "."):
+		var segments := path.split(".")
+		if segments.size() != 3:
+			push_error("set 的 role 路径形状不对：%s" % path)
+			return
+		session.set_character_property(segments[1], segments[2], String(value))
 		return
 
-	session.set_character_property(segments[1], segments[2], value)
+	session.set_var(path, value, how)
+
+## 玩法侧写变量。路径必须是剧本里 default 声明过的，否则拒绝。
+##
+## 走和剧本 set 完全一样的那条路（VNSession.set_var），所以玩法侧不需要
+## 自己判类型，也不会写出一个剧本里不存在的变量
+func set_var(path: String, value: Variant) -> bool:
+	if not is_var_declared(path):
+		push_error("VN.set_var：\"%s\" 没有 default 声明，不能凭空创建变量" % path)
+		return false
+	session.set_var(path, value, "=")
+	return true
+
+## 这个路径是不是剧本里声明过的变量（含点路径）
+func is_var_declared(path: String) -> bool:
+	for d in story.defaults:
+		if d is Dictionary and String(d.get("path", "")) == path:
+			return true
+	return false
 
 ## 执行 show / show_front。属性如何累加由 VNSession 决定
 ##
@@ -1231,6 +1470,18 @@ func _apply_stop_music(op: Dictionary) -> void:
 ## 执行 stop sound。args[0] 是淡出秒数，空串表示瞬停
 func _apply_stop_sound(op: Dictionary) -> void:
 	audio.stop_sound(_arg_float(op["args"], 0, 0.0))
+
+## 执行 save。把槽名和此刻的进度快照一起交给应用层。
+##
+## 快照必须在这里取：save 后面常常紧跟 jump / call，它们会立刻改 _cursor。
+## 让应用层到帧末再 capture_state()，存下来的位置已经是好几条之后了。
+##
+## 不等待落盘 —— 播放器不认识文件，抓缩略图和写盘都是应用层的事
+func _apply_save(op: Dictionary) -> void:
+	var args: Array = op["args"]
+	if args.is_empty():
+		return
+	save_requested.emit(String(args[0]), capture_state())
 
 ## 取一个浮点参数。越界或空串时返回 fallback
 func _arg_float(args: Array, index: int, fallback: float) -> float:
@@ -1439,14 +1690,17 @@ func _clear_pause() -> void:
 	_pause_wait_tag = ""
 	set_process(false)
 
-## 丢掉还没生效的 ATL wait。
+## 丢掉还没生效的 ATL wait 与内联跳转。
 ##
 ## 换位置的入口调用它：那条 show 已经在上一处执行过了，它的等待属于
-## "从那条指令往下走"的流程，新位置不该继承。和 _clear_pause 分开，
-## 是因为两者的生命周期不同 —— pause 是"正在等"，pending 是"马上要等"
+## "从那条指令往下走"的流程，新位置不该继承。内联跳转同理 —— 玩家的
+## 那一下点击是针对旧位置的，搬走之后就作废了。
+## 和 _clear_pause 分开，是因为两者的生命周期不同 ——
+## pause 是"正在等"，pending 是"马上要执行"
 func _clear_pending_wait() -> void:
 	_pending_wait = 0.0
 	_pending_wait_tag = ""
+	_pending_jump = ""
 
 ## pause 的倒计时。只在定时等待时开着 —— 无参 pause 与冻结期间不需要每帧跑
 func _process(_delta: float) -> void:
@@ -1495,42 +1749,68 @@ func _show_current() -> void:
 
 	# 记历史。
 	#
-	# 存的是 tr() 之后的两段文字：历史记的是"玩家当时读到的内容"，
-	# 而 tr() 是单向的 —— 存了原文反而拿不回 msgid，切语言时也没法重译。
+	# 历史和附言存的是**原文**，只有发给界面的那两段是译文。
+	#
+	# 曾经存的是译文，理由是"历史记的是玩家当时读到的内容"。但那样切语言
+	# 之后旧记录永远停在上一门语言 —— 而且 tr() 是单向的，存了译文就再也
+	# 拿不回 msgid。现在改为存原文、显示时翻译（见 history.gd 与
+	# save_load.gd 的附言渲染），旧存档里的译文会被 tr() 原样返回，
+	# 两种格式可以共存。
 	#
 	# 位置用 capture_position()：advance() 是先加一后取，走到这里时
 	# _cursor 正指着这条 say 指令，快照拿到的就是它。快进时同样会走到
 	# 这里，所以快进过的句子照记，和 Ren'Py 一致
-	# tr() 只算一次。原来这里把它调了两遍（历史一次、信号一次），
-	# 加上下面要记的附言就是三遍 —— 纯函数，结果相同，但没必要
 	var shown_who := tr(who)
-	var shown_text := tr(text)
-	session.set_last_say_text(shown_text)
+	# 插值放在 tr 之后：译文里同样可以写 [变量]。历史存的是原文，
+	# 那边显示时再各自插值一次
+	var shown_text := session.interpolate(tr(text))
+	session.set_last_say_text(text)
 
 	# 姿态也在这一刻抓：这条历史指向的就是"现在这个画面"。
 	# 等玩家以后从别的章节跳回来时，抓不到这一刻 —— 那时屏幕上早换人了
-	session.add_history(current_sid(), shown_who, shown_text, voice,
+	session.add_history(current_sid(), who, text, voice,
 		capture_position(), session.stage_poses())
 
 	line_shown.emit(shown_who, shown_text)
 
-	# 两个报告都放在 line_shown 之后：这一刻界面已经拿到台词了，
-	# 应用层收到就能接着做"抓图 + 存档"这件事。
-	# 入口报告在前 —— 它对应用层的含义更基础（我到了这一章的开头），
-	# 章节点在后。两者在同一帧发出，应用层会把它们合并成一次抓图
-	_announce_entry()
+	# 章节报告放在 line_shown 之后：这一刻界面已经拿到台词了，
+	# 应用层收到就能接着做"抓图 + 存档"这件事
 	_announce_chapter()
 
-## 从章节入口进来就报一次。
+## 切语言之后重译**当前停在的这一句**。
 ##
-## 消费点必须在**这一句台词**上，而不能在置位那一刻就地发：label 入口和第一句
-## 台词之间可能夹着 scene / show / set，标量要一直留到画面真的换了内容，
-## 应用层才有东西可抓
-func _announce_entry() -> void:
-	if not _label_fresh:
+## ── 只重发 line_shown ──
+## 语音、章节报告都不动：语音已经在播了，重译不该让它从头再来；
+## 章节报告只在真正进入新章节时发一次。
+##
+## 历史**不用动**：它存的是原文，切语言后由 history.gd 在显示时翻译。
+##
+## ── 附言也存原文 ──
+## 存档的附言取"最近一句台词的原文"（session 的 last_say_text），
+## 显示时才翻译。所以这里更新它是为了"切完语言马上存档"那一刻附言正确，
+## 而不是为了把译文写进存档
+##
+## 停在非台词指令（pause、scene 之类）上时什么都不做 —— 那种时刻屏幕上
+## 没有可翻的文字
+func retranslate_current() -> void:
+	if not _playing or _cursor < 0 or _cursor >= story.ops.size():
 		return
-	_label_fresh = false
-	label_entered.emit(_label_name)
+
+	var op: Dictionary = story.ops[_cursor]
+	var kind: String = op["op"]
+	if kind != "say" and kind != "say_literal":
+		return
+
+	var args: Array = op["args"]
+	var who_raw := String(args[0]) if args.size() > 0 else ""
+	var text := String(args[1]) if args.size() > 1 else ""
+	var who := who_raw if kind == "say_literal" else _resolve_role_name(who_raw)
+
+	# 和 _exec 里那条路保持一致：先 tr 再插值。只 tr 不插值的话，
+	# 切完语言停在带变量的句子上，占位符会原样露出来
+	var shown_text := session.interpolate(tr(text))
+	session.set_last_say_text(text)
+	line_shown.emit(tr(who), shown_text)
 
 ## 进了新章节就报一次。
 ##
