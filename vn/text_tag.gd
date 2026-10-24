@@ -40,7 +40,7 @@ extends RefCounted
 ## {/} 不在表里 —— 它不是某个标签的闭合，而是"把还没关的一次性关掉"，
 ## 见 parse() 里的那段分支。
 const PAIRED := ["b", "i", "u", "s", "color", "size", "outline", "outlinecolor",
-	"cps", "font", "url", "jump", "call"]
+	"cps", "font", "url", "jump", "call", "a", "alpha"]
 
 ## 跳转类标签在 meta 里的前缀。
 ##
@@ -55,6 +55,14 @@ const JUMP_PREFIX := "jump:"
 ## 与 jump 的差别只在点中之后：jump 一去不回，call 在目标 label 走到
 ## return 时回到**触发它的那一句**（Ren'Py 的 from_current 语义）。
 const CALL_PREFIX := "call:"
+
+## {a=值} 在 meta 里的前缀。
+##
+## 这是给开发者的扩展口：框架完全不解释值，原样转成一个信号就完事。
+## 加前缀是做**隔离**，不是做协议 —— 不带前缀的话，{a=jump:foo} 的 meta
+## 和 {jump=foo} 会变成同一个字符串，那个值就会绕过开发者直接触发跳转。
+## 剥掉这个前缀之后，剩下的就是一串普通文本，框架不会再拿它比对任何东西
+const LINK_PREFIX := "a:"
 
 ## 自闭合的点事件标签：它们不改样式、不进栈，只在 events 里留一条
 ## "到此为止"的标记，由打字机按位置触发
@@ -218,11 +226,13 @@ static func parse(text: String, base_size: int = 0) -> Dictionary:
 
 ## 转成 RichTextLabel 认得的一串 BBCode。
 ##
-## base_size 同 parse()，只影响相对字号。images / link_style 见
+## base_size 同 parse()，只影响相对字号。images / link_style / base_color 见
 ## runs_to_bbcode()。
 static func to_bbcode(text: String, base_size: int = 0,
-		images: Dictionary = {}, link_style: Dictionary = {}) -> String:
-	return runs_to_bbcode(parse(text, base_size)["runs"], images, link_style)
+		images: Dictionary = {}, link_style: Dictionary = {},
+		base_color: Color = Color.WHITE) -> String:
+	return runs_to_bbcode(parse(text, base_size)["runs"], images, link_style,
+		base_color)
 
 
 ## 把已经解析好的 runs 转成 BBCode。
@@ -236,8 +246,12 @@ static func to_bbcode(text: String, base_size: int = 0,
 ## link_style 是链接外观：{ "idle": Color, "hover": Color,
 ## "hover_id": String, "underline": bool }。{url=} 的开标签把它写进
 ## [url] 的参数里；hover_id 与地址相同时用 hover 色
+##
+## base_color 是控件正文字色的基线，只有 {alpha} 用得上 —— 只写透明度
+## 不写颜色时，得知道要透明的那个颜色原本是什么
 static func runs_to_bbcode(runs: Array, images: Dictionary = {},
-		link_style: Dictionary = {}) -> String:
+		link_style: Dictionary = {},
+		base_color: Color = Color.WHITE) -> String:
 	var parts := PackedStringArray()
 	for run: Dictionary in runs:
 		# 内联图：路径在这一步才查。parse 保持纯文本处理，不碰资源表 ——
@@ -253,7 +267,7 @@ static func runs_to_bbcode(runs: Array, images: Dictionary = {},
 		var font_path := ""
 		if style.has("font"):
 			font_path = VNI18n.inline_font_path(String(style["font"]))
-		parts.append(_open_tags(style, font_path, link_style))
+		parts.append(_open_tags(style, font_path, link_style, base_color))
 		parts.append(_escape_bbcode(String(run["text"])))
 		parts.append(_close_tags(style, font_path))
 	return "".join(parts)
@@ -323,6 +337,17 @@ static func _current_size(stack: Array[Dictionary], base_size: int) -> int:
 	return base_size
 
 
+## 当前生效的透明度。栈里没有 alpha 就是完全不透明。
+##
+## {alpha=+0.2} / {alpha=*0.5} 这类相对写法要拿它当基准，
+## 所以取值和解析是两个函数：这个只回答"现在是多少"，不算新值
+static func _current_alpha(stack: Array[Dictionary]) -> float:
+	for i in range(stack.size() - 1, -1, -1):
+		if String(stack[i]["name"]) == "alpha":
+			return float(stack[i]["value"])
+	return 1.0
+
+
 ## 把整条标签栈折叠成一份完整样式快照。
 ##
 ## 键只在"被显式设置过"时出现：{size} 出现在 {b} 里时，快照里同时有
@@ -348,10 +373,13 @@ static func _collapse(stack: Array[Dictionary]) -> Dictionary:
 			"font":
 				style["font"] = entry["value"]
 			# url 也存地址原文，颜色和 underline 由输出端按作品配置拼。
-			# jump / call 也落到同一个样式键：输出端只认 style["url"]，
+			# jump / call / a 也落到同一个样式键：输出端只认 style["url"]，
 			# 值里的前缀已经决定了点击时走哪条路
-			"url", "jump", "call":
+			"url", "jump", "call", "a":
 				style["url"] = entry["value"]
+			# alpha 存的是已经结算过的绝对值，与 size 同理
+			"alpha":
+				style["alpha"] = entry["value"]
 	return style
 
 
@@ -431,6 +459,29 @@ static func _make_entry(name: String, raw: String,
 			# 点击时看前缀就知道该跳剧情、读一段再回来，还是开浏览器
 			var prefix := JUMP_PREFIX if name == "jump" else CALL_PREFIX
 			return {"name": name, "value": prefix + target}
+
+		"a":
+			# 开发者的扩展口。除了"不能是空的、不能带空格"，这里什么都不拦 ——
+			# 冒号、斜杠之类都随作者写，因为含义由订阅方定义。
+			#
+			# 空格必须挡掉：值最终写进 [url href=... underline=...] 的 options，
+			# 而 options 是按空格切分的 —— 带空格的值会被切成两段，
+			# href 只剩前半截，后半截当成未知参数丢掉。要传复杂内容，
+			# 用逗号、竖线这类不含空格的自己约定分隔符
+			var payload := raw.strip_edges()
+			if payload.is_empty() or payload.contains(" ") \
+					or payload.contains("\t"):
+				return {}
+			return {"name": "a", "value": LINK_PREFIX + payload}
+
+		"alpha":
+			# 与 {size} 同一个套路：存**绝对值**，相对写法在解析这一刻就结算掉。
+			# 不这么做的话，嵌套里再改一次外层就没法复现 —— 而 Alpha 是
+			# 逐层相乘/相加出来的，必须固定在当前上下文里
+			var opacity := _resolve_alpha(raw, _current_alpha(stack))
+			if opacity < 0.0:
+				return {}
+			return {"name": "alpha", "value": opacity}
 
 		"image":
 			return _make_image_entry(raw)
@@ -590,6 +641,29 @@ static func _resolve_size(raw: String, current: int) -> int:
 	return maxi(1, raw.to_int())
 
 
+## 解析 {alpha} 的参数，返回绝对透明度（0 全透明，1 不透明）。
+##
+## 三种写法与 Ren'Py 一致：0.5（绝对值）、+0.2 / -0.2（在当前值上加减）、
+## *0.5（乘）。结果夹到 [0, 1] —— 越界的透明度没有意义，
+## 而宽进严出比让作者去猜为什么字消失了更友好。非法返回 -1。
+static func _resolve_alpha(raw: String, current: float) -> float:
+	var text := raw.strip_edges()
+	if text.is_empty():
+		return -1.0
+
+	if text.begins_with("*"):
+		var body := text.substr(1)
+		if not body.is_valid_float():
+			return -1.0
+		return clampf(current * body.to_float(), 0.0, 1.0)
+
+	if not text.is_valid_float():
+		return -1.0
+	if text.begins_with("+") or text.begins_with("-"):
+		return clampf(current + text.to_float(), 0.0, 1.0)
+	return clampf(text.to_float(), 0.0, 1.0)
+
+
 ###########################################################
 #  内部：输出
 ###########################################################
@@ -597,9 +671,14 @@ static func _resolve_size(raw: String, current: int) -> int:
 ## 一段样式的开工标签。顺序固定，保证每次输出的嵌套关系一致。
 ##
 ## font_path 由调用方查好再传进来：字体名到路径的解析要碰作品配置，
-## 不该让这个纯拼接函数知道。link_style 同理，只用来挑 url 的颜色
+## 不该让这个纯拼接函数知道。link_style 同理，只用来挑 url 的颜色。
+##
+## base_color 是控件正文字色的基线，只有 {alpha} 用得上：RichTextLabel
+## 没有独立的透明度标签，只能合成进 [color] 的第四个字节，而"只要透明、
+## 没写颜色"时也必须知道 RGB 是多少
 static func _open_tags(style: Dictionary, font_path := "",
-		link_style: Dictionary = {}) -> String:
+		link_style: Dictionary = {},
+		base_color: Color = Color.WHITE) -> String:
 	var out := ""
 	# 颜色排最外层。链接的常态/悬停色只能用 [color] 给 ——
 	# [url] 的 options 只认 href / underline / tooltip，没有颜色。
@@ -607,6 +686,13 @@ static func _open_tags(style: Dictionary, font_path := "",
 	var color := String(style.get("color", ""))
 	if color.is_empty() and style.has("url"):
 		color = _link_color(String(style["url"]), link_style)
+	# 透明度并进颜色：作者写了 {color} 就用它当底，没写就用控件正文色。
+	# 悬停变色走的也是这一条路，所以链接高亮时透明度不会丢
+	if style.has("alpha"):
+		var base := color
+		if base.is_empty():
+			base = "#" + base_color.to_html(false)
+		color = _with_alpha(base, float(style["alpha"]))
 	if not color.is_empty():
 		out += "[color=%s]" % color
 
@@ -650,6 +736,16 @@ static func _link_color(address: String, link_style: Dictionary) -> String:
 	return "#" + color.to_html(false)
 
 
+## 把一个 #rgb / #rrggbb / #rrggbbaa 的颜色换成指定透明度，返回 #rrggbbaa。
+##
+## 走 Color 而不是自己拼字符串：短写法的补全、8 位原色的截断都由它兜着，
+## 这里只需要回答"换成这个透明度之后长什么样"
+static func _with_alpha(hex: String, alpha: float) -> String:
+	var color := Color(hex)
+	color.a = clampf(alpha, 0.0, 1.0)
+	return "#" + color.to_html(true)
+
+
 ## 一段样式的收工标签。必须是 _open_tags() 的逆序 —— BBCode 是栈式的，
 ## 乱序闭合在 RichTextLabel 里会把后面的样式带歪。
 static func _close_tags(style: Dictionary, font_path := "") -> String:
@@ -672,8 +768,9 @@ static func _close_tags(style: Dictionary, font_path := "") -> String:
 		out += "[/b]"
 	if style.has("url"):
 		out += "[/url]"
-	# 颜色可能是作者写的，也可能是 _open_tags() 为链接补的，两种都要关
-	if style.has("color") or style.has("url"):
+	# 颜色可能是作者写的，也可能是 _open_tags() 为链接或 {alpha} 补的，
+	# 这几种都要关。三者共用同一个 [color]，只关一次
+	if style.has("color") or style.has("url") or style.has("alpha"):
 		out += "[/color]"
 	return out
 

@@ -141,7 +141,12 @@ func set_link_hover(address: String) -> void:
 
 ## 按当前悬停状态生成 BBCode。
 ##
-## 链接的颜色与下划线来自作品配置，不写死在剧本里
+## 链接的颜色与下划线来自作品配置，不写死在剧本里。
+##
+## 正文色也一并传下去：{alpha} 只能并进 [color] 的第四个字节，
+## 而"只写透明度不写颜色"时，得知道要被透明化的那个颜色是什么。
+## 现问现取而不是缓存 —— 切主题、换界面都可能改它，而这只在重建
+## BBCode 时调用一次
 func _build_bbcode() -> String:
 	var s := VNSettings.get_current()
 	return VNTextTag.runs_to_bbcode(_runs, _images, {
@@ -149,7 +154,7 @@ func _build_bbcode() -> String:
 		"hover": s.link_hover_color,
 		"hover_id": _hover_id,
 		"underline": s.link_underline,
-	})
+	}, get_theme_color(&"default_color"))
 
 ## 清空文本并停止打字。窗口在下一句台词之前就显示时用它，
 ## 避免上一句的内容跟着对话框一起淡入。

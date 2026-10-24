@@ -111,6 +111,20 @@ signal audio_prefetch_requested(paths: Array)
 ## 有个上限才能给出可查的错误，而不是崩在分配失败上
 const MAX_CALL_DEPTH := 256
 
+## 恢复位置时舞台的来源。
+##
+##   STAGE_AUTO      有快照就用，没有就重放。留给不传来源的调用方
+##   STAGE_SNAPSHOT  一定用快照 —— 即使快照里舞台是空的，"那一刻台上
+##                   什么都没有"也是一个合法且必须尊重的事实
+##   STAGE_REPLAY    一定重放指令流。只在"要按新剧本重算画面"时才有意义
+##
+## 为什么要三种而不是"空字典就当没有快照"：那种写法把"台上本来就没东西"
+## 和"没有快照"混成一种情况，于是空舞台会被误判成需要重放，而重放按新
+## 指令流可能建出东西来 —— 读档后凭空多出一个立绘
+const STAGE_AUTO := ""
+const STAGE_SNAPSHOT := "snapshot"
+const STAGE_REPLAY := "replay"
+
 ## 预取往后看多少条指令。数值与 Ren'Py 的 config.predict_statements 一致
 const PREFETCH_DEPTH := 32
 
@@ -118,6 +132,10 @@ const PREFETCH_DEPTH := 32
 ## 那是显示层的事。preload 而不是 class_name：新脚本第一次被引用时，
 ## 全局类表可能还没登记它
 const ATL_SCRIPT := preload("res://vn/ui/atl.gd")
+
+## 快照里 delta 的撤销逻辑。纯静态函数库、没有实例，所以同样走 preload ——
+## 理由与 ATL_SCRIPT 一样，而且它不该为了几个纯函数去占一个全局类名
+const SNAPSHOT := preload("res://vn/snapshot.gd")
 
 ## start() 的进入方式
 enum StartMode {
@@ -353,6 +371,11 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 	# 上一局若停在 pause 里，新的一局不该继承这个等待
 	_clear_pause()
 	_clear_pending_wait()
+	# 补齐剧本里声明过、但变量表里还没有的量。NEW_GAME 上面那条 reset_vars
+	# 已经把整张表灌好了，这里对它是空操作；CONTINUE（章节切换）才是它
+	# 真正起作用的地方 —— 新章节新增的 default 不该等到第一次 += 才从零起算。
+	# 对应 Ren'Py 在开局与读档后各调一次的 execute_default_statement
+	_apply_missing_defaults()
 	_cursor = begin - 1
 	_playing = true
 	advance()
@@ -744,20 +767,20 @@ func capture_position() -> Dictionary:
 ## 调用方负责保证快照里的 cursor 对**当前**指令流有意义 ——
 ## 这份接口不做校验，也没法做：它不知道指令流换过没有。
 ##
-## poses 是存档里那份各 tag 的显示姿态。读档时传进来，重建出来的节点
-## 才能停在存档那一刻的位置上；热重载不传，走显示层自己的"销毁前抓一份"那条路
+## poses 是快照里那份各 tag 的显示姿态。给了解析出来的节点才能停在该停的
+## 位置上；不给就走显示层自己的"销毁前抓一份"那条路
 ##
-## stage_snapshot 是存档里那份舞台结构。给了就用它直接还原，没给才重放
-## 指令流。三个调用方的取舍：
-##   读档     → 有结构快照，用它（精确，且不受 {call=} 这类点击跳转影响）
-##   历史跳转 → 历史条目只记了姿态，没有结构，只能重放
-##   热重载   → 没有快照，且剧本刚改过，本来就该按新指令重算
+## stage_snapshot 是舞台结构。stage_source 决定信不信它：
+##   STAGE_SNAPSHOT  一定按它还原（读档、历史回跳、热重载）
+##   STAGE_REPLAY    一定重放指令流（将来的"按新剧本重算画面"）
+##   STAGE_AUTO      空字典才重放，留给不传来源的老调用方
 ##
-## 历史条目不带结构是有意的：一条历史存一份舞台会让存档里几百条各带几 KB，
-## 而回跳的绝大多数落点都在主线上，重放得出来。回跳到 {call=} 子剧情
-## 内部的那一条同样能走对 —— 目标从恢复出来的调用栈里取，见 rebuild_stage()
+## 三条路现在都传 STAGE_SNAPSHOT。历史条目带结构之后，"回跳只能重放"
+## 那个限制消失了 —— 重放要求控制流完全可复现，而 {call=} 这类由玩家
+## 点出来的分支只在调用栈里，重放要额外维护一堆匹配逻辑（见 rebuild_stage）
 func restore_position(snapshot: Dictionary, poses: Dictionary = {},
-		stage_snapshot: Dictionary = {}) -> void:
+		stage_snapshot: Dictionary = {},
+		stage_source: String = STAGE_AUTO) -> void:
 	if not _check_ready():
 		return
 
@@ -801,25 +824,38 @@ func restore_position(snapshot: Dictionary, poses: Dictionary = {},
 		if hop is Dictionary:
 			_inline_jumps.append((hop as Dictionary).duplicate(true))
 
+	# 舞台来源先定下来，下面的顺序要按它分叉
+	var use_snapshot := not stage_snapshot.is_empty()
+	if stage_source == STAGE_SNAPSHOT:
+		use_snapshot = true
+	elif stage_source == STAGE_REPLAY:
+		use_snapshot = false
+
 	_playing = true
 	# 恢复途中遇到 with_run 直接跳过。读档是定位，不是播放
 	_restoring = true
-	advance()
-	_restoring = false
+
+	# ── 顺序：舞台先就位，再往后执行 ──
+	#
+	# 反过来的话（先 advance 再贴快照），advance 执行的那些 scene / show
+	# 会被"存档那一刻"的旧快照整个盖掉。存档点落在 scene 之前时那份快照
+	# 正是空的 —— 表现就是"读档后剧情已经走到第一句，画面却全空"。
+	# ep0.vns 的 fc-ep0_1 就是这种存档点：save 在 scene bg1 的两行之前。
+	#
+	# 重放路径只能倒过来：它要靠 advance() 先把 _cursor 推到目标句，
+	# 才能从会话入口重放到那里。两条路的差异只在这一处
+	if use_snapshot:
+		session.restore_stage(stage_snapshot, poses)
+		advance()
+		_restoring = false
+	else:
+		advance()
+		_restoring = false
+		rebuild_stage(poses)
 
 	# advance() 只在途中遇到 label 指令时才更新 _label_begin。
 	# 从一句台词直接恢复时它不会经过 label，所以这里补一次同步
 	_sync_label_at_cursor()
-
-	# 舞台。有结构快照就照它还原，否则按新指令流重放。
-	#
-	# 位置对了不等于画面对了 —— 剧本里改过的 show / hide 只有重放一遍才会
-	# 反映到屏幕上；而"重放到一半的动画"只有 pose 能还原。
-	# 所以两条路都以"结构 + 姿态"收尾，只是结构从哪来不同
-	if stage_snapshot.is_empty():
-		rebuild_stage(poses)
-	else:
-		session.restore_stage(stage_snapshot, poses)
 
 ## 从磁盘重新读一遍剧本包。
 ## 调用方负责在此之前取好位置快照，之后用 restore_position() 放回去
@@ -832,13 +868,16 @@ func reload_story() -> bool:
 #  存档状态
 ###########################################################
 
-## 取一份完整状态，直接就是 VNSave 认的存档结构（除了缩略图与展示信息）。
+## 取一份完整快照：位置、舞台、变量、角色属性、历史、音乐、姿态。
 ##
-## 与 capture_position() 的分工：那个只回答"停在哪"，这个回答"这一局是什么样"。
-## 存档要的是后者，热重载要的是前者，所以两个接口都留着。
+## 三条路共用这一份 —— 存档（VNSave 把它切成两块字节）、历史回跳（条目里
+## 存的是它的迷你版）、热重载（重载前后各取一次）。
 ##
-## 键名全部取自 VNSave.F_* —— 存与读共用一套常量，不会出现
-## "写的时候叫 A、读的时候叫 B"这种只在读档时才暴露的错
+## 与 capture_position() 的分工：那个只回答"停在哪"，这个回答"这一局是什么
+## 样"。存档要后者，热重载要后者，两个接口都留着是因为 rebuild 那一侧只要
+## 位置。
+##
+## 键名全部取自 VNSave.F_* —— 形状只有一份定义，存与读不会走散
 ##
 ## ── 舞台为什么要存 ──
 ## 早先不存，靠 restore_position() 从会话入口重放指令流重建。那个办法要求
@@ -852,7 +891,7 @@ func reload_story() -> bool:
 ##
 ## F_STAGE 存结构（谁在台上），F_POSE 存姿态（他们在哪）：
 ## 前者指令里没有，后者只有那一帧才有，两样都得留下来
-func capture_state() -> Dictionary:
+func capture_snapshot() -> Dictionary:
 	return {
 		VNSave.F_POSITION: capture_position(),
 		VNSave.F_SID: current_sid(),
@@ -861,39 +900,133 @@ func capture_state() -> Dictionary:
 		VNSave.F_STAGE: session.stage(),
 		VNSave.F_HISTORY: session.history_data(),
 		VNSave.F_VARS: session.vars_data(),
-		VNSave.F_BGM: audio.current_bgm(),
+		VNSave.F_BGM: audio.current_bgm() if audio != null else "",
 		VNSave.F_WHAT: session.interpolate(tr(session.last_say_text())),
 		VNSave.F_POSE: session.stage_poses(),
 	}
 
-## 从一份存档数据恢复整局状态，并立刻播出存档处那一句。
+## 存档用的旧名字。内容层（save_entry.gd / main.gd）还在叫它，
+## 行为与 capture_snapshot() 完全一样
+func capture_state() -> Dictionary:
+	return capture_snapshot()
+
+## 从一份快照恢复整局状态，并立刻播出目标那一句。
 ##
-## data 是 VNSave.read() 返回的那个字典。成功返回 true。
-## 恢复顺序有三处讲究，每一处都不能调换，见段内注释
-func restore_state(data: Dictionary) -> bool:
+## 这是**唯一**的恢复路径：读档、历史回跳、热重载都走它。顺序在下面逐条
+## 注明，每一处的先后都不能换 —— 换过的症状都写在各自那段注释里。
+##
+## opts 目前只认一个键 "resolved"：true 表示 F_POSITION 已经过
+## VNPosition.resolve()，不要重复迁移（热重载就是这种）。默认 false。
+func restore_snapshot(snap: Dictionary, opts: Dictionary = {}) -> bool:
 	if not _check_ready():
 		return false
 
-	if data.is_empty():
-		push_error("读档：存档数据为空")
+	if snap.is_empty():
+		push_error("恢复快照：数据为空")
 		return false
 
 	# 指令流不在就先加载。从主菜单读档时 VN 还没开播、story 是空的；
 	# 从剧情里读档时它已经在，重读一次纯属浪费
 	if story.ops.is_empty() and not story.load_story(package_path):
-		push_error("读档：剧本加载失败 %s" % package_path)
+		push_error("恢复快照：剧本加载失败 %s" % package_path)
 		return false
 
-	var snapshot: Dictionary = data.get(VNSave.F_POSITION, {})
-	var sid := int(data.get(VNSave.F_SID, 0))
-	var anchors: PackedInt64Array = data.get(VNSave.F_ANCHORS, PackedInt64Array())
+	# 上一段剧情留下的变更日志到此作废。不清的话，回跳之后下一句的
+	# vars_delta 里会混进读档之前那些改动 —— 那些改动属于被丢掉的时间线
+	session.discard_journal()
 
-	# ── 定位：把存档时的下标搬到当前指令流上 ──
+	# ── 定位：把快照里的下标搬到当前指令流上 ──
 	#
-	# 存档可能是上一个剧本版本存的，cursor 不能直接用。三级策略与热重载
+	# 快照可能是上一个剧本版本存的，cursor 不能直接用。三级策略与热重载
 	# 共用同一份实现，见 vn/position.gd
-	var moved := VNPosition.resolve(snapshot, sid, anchors, story.ops,
-		Callable(story, "label_start"))
+	var snapshot: Dictionary = snap.get(VNSave.F_POSITION, {})
+	var moved := snapshot
+	if not bool(opts.get("resolved", false)):
+		moved = VNPosition.resolve(snapshot,
+			int(snap.get(VNSave.F_SID, 0)),
+			snap.get(VNSave.F_ANCHORS, PackedInt64Array()),
+			story.ops, Callable(story, "label_start"))
+		_report_resolution(moved)
+
+	# ── 数据先就位，再放回位置 ──
+	#
+	# restore_position() 内部会 advance()，那会立刻播出目标那一句并把它
+	# 追加进历史。历史必须先就位，VNHistory.add() 的"只比最后一条"去重
+	# 才挡得住这次重复追加。反过来的话，读档后历史末尾会多出一条
+	# 一模一样的
+	session.restore_roles(snap.get(VNSave.F_ROLES, {}))
+	session.restore_vars(snap.get(VNSave.F_VARS, {}))
+	# 变量就位之后立刻补 default：advance() 里的插值要读它们，缺了的
+	# 变量会以 "[gold]" 的形式原样印在台词上
+	_apply_missing_defaults()
+	session.restore_history(snap.get(VNSave.F_HISTORY, []))
+
+	# 交回给下一句的变更记录。热重载截掉历史最后一条时，那条里的 delta
+	# 不能丢 —— 并回日志，_show_current() 重写这一句时会把它们带走。
+	# 读档不走这条：存档里的历史是完整的，没有任何条目被临时拿掉
+	var carry: Dictionary = opts.get("carry_delta", {})
+	if not carry.is_empty():
+		session.merge_journal(carry.get("vars", {}), carry.get("roles", {}))
+
+	# ── 音乐 ──
+	#
+	# 必须在 restore_position() **之前**：它会 advance() 到目标那一句并
+	# 走 _show_current()，那里拿 audio.current_bgm() 写进新历史条目。
+	# 晚一步切的话，历史记下的还是切换前那首旧曲子。
+	#
+	# 一律从头重播（play_bgm_from 不判重），与历史回跳同一个语义。
+	# play_bgm() 会在"同一首正在播"时直接返回，读档就变成了"接着放" ——
+	# 那是回主菜单、章节往返要的连播，不是回到过去该有的行为。
+	#
+	# 空串走 stop_bgm() 而不是 play_bgm("")：后者会去检查一个不存在的
+	# 资源路径然后打一条"背景音乐缺失"的警告 —— 那是误报，
+	# "存档时本来就没有音乐"是完全正常的状态
+	var bgm := String(snap.get(VNSave.F_BGM, ""))
+	if audio != null:
+		if bgm.is_empty():
+			audio.stop_bgm()
+		else:
+			audio.play_bgm_from(bgm, 0.0)
+
+	# ── 位置与舞台 ──
+	#
+	# 舞台来源写死 STAGE_SNAPSHOT：快照里就是那一刻的画面，重放只会因为
+	# 剧本改动而算歪。热重载也用快照 —— 角色被删掉的 tag 由显示层跳过，
+	# 那比"清空舞台"更接近玩家重载前看到的东西
+	restore_position(moved,
+		snap.get(VNSave.F_POSE, {}),
+		snap.get(VNSave.F_STAGE, {}),
+		STAGE_SNAPSHOT)
+
+	return true
+
+## 按剧本的 default 表补齐**当前不存在**的变量。
+##
+## 对应 Ren'Py 的 execute_default_statement(False)：读档与回滚之后都会调用
+## （rollback.py:1045）。补的是"旧存档里还没有这个变量"的情况 —— 剧本后来
+## 加了 default，玩家读旧档时那个量必须有初值，否则第一次 "+=" 会从零值
+## 起算，插值则直接把 [变量名] 露在台词里。
+##
+## start=False 的语义：已经存在的变量**不覆盖**。这正是它与 reset_vars()
+## 的分界 —— 后者是开新局，前者是"把缺的补上"
+func _apply_missing_defaults() -> void:
+	for d in story.defaults:
+		if not (d is Dictionary):
+			continue
+		var path := String(d.get("path", ""))
+		if path.is_empty() or session.has_var(path):
+			continue
+		session.set_var(path,
+			VNSession.decode_value(String(d.get("kind", "s")),
+				String(d.get("value", ""))),
+			"=", false)
+
+## 把位置迁移走了哪一级报出来。读档时这是玩家唯一能感知到"落点不是原来
+## 那一句"的线索，不该静默发生。
+##
+## 热重载有自己更细的报告（见 vn/dev/hot_reload.gd），那边传 resolved=true
+## 跳过这一步，免得同一个判断被报两次
+func _report_resolution(moved: Dictionary) -> void:
 	match String(moved.get("how", "")):
 		VNPosition.HOW_ANCHOR:
 			# sid 还在、只是那条指令不是台词 —— 剧本里写的流程存档点
@@ -905,47 +1038,32 @@ func restore_state(data: Dictionary) -> bool:
 		VNPosition.HOW_LABEL, VNPosition.HOW_STACK:
 			push_warning("读档：这一句在当前剧本里找不到了，已退回章节开头")
 
-	# ── 数据先就位，再放回位置 ──
-	#
-	# restore_position() 内部会 advance()，那会立刻播出目标那一句并把它
-	# 追加进历史。历史必须先就位，VNHistory.add() 的"只比最后一条"去重
-	# 才挡得住这次重复追加。反过来的话，读档后历史末尾会多出一条一模一样的
-	session.restore_roles(data.get(VNSave.F_ROLES, {}))
-	session.restore_history(data.get(VNSave.F_HISTORY, []))
-	# 变量必须在 restore_position() 之前就位：它内部 advance() 会走到下一句，
-	# 途中的 show 之类不读变量，但剧本随时可能用 [变量] 插值 ——
-	# 而且 rebuild_stage() 已经不重放 set 了，这里是唯一的值来源
-	session.restore_vars(data.get(VNSave.F_VARS, {}))
-
-	# 舞台姿态。旧存档里没有这一项，空字典会让重建退回"居中 + 重播"
-	var poses: Dictionary = data.get(VNSave.F_POSE, {})
-	# 舞台结构。旧存档里没有这一项，空字典会让 restore_position() 退回
-	# "重放指令流"那条老路 —— 存档在 {call=} 内部时那条路会跑飞，
-	# 但那时也只能如此，总比一片空白好
-	restore_position(moved, poses, data.get(VNSave.F_STAGE, {}))
-
-	# ── 音乐 ──
-	#
-	# 空串走 stop_bgm() 而不是 play_bgm("")：后者会去检查一个不存在的资源
-	# 路径，然后打一条"背景音乐缺失"的警告 —— 那是误报，
-	# "存档时本来就没有音乐"是完全正常的状态
-	var bgm := String(data.get(VNSave.F_BGM, ""))
-	if bgm.is_empty():
-		audio.stop_bgm()
-	else:
-		audio.play_bgm(bgm)
-
-	return true
+## 存档用的旧名字。行为与 restore_snapshot() 完全一样
+func restore_state(data: Dictionary) -> bool:
+	return restore_snapshot(data)
 
 ## 回跳到历史里的第 index 条。成功返回 true。
 ##
-## 这就是"点击回跳"的落点。restore_position() 会把剧情位置搬回去并重放
-## 舞台，而它内部走 advance() → _show_current() 会重新显示那一句 ——
-## 那一次追加会被 add() 的 sid 去重挡掉，所以历史不会因此多出一条。
+## 历史条目带的是那一刻的迷你快照：位置、舞台结构、姿态、音乐，以及变量与
+## 角色属性的变更日志。所以回跳只是"恢复一份快照" —— 与读档同一条路，
+## 不再靠重放指令流去猜画面。
 ##
-## **顺序不能反：先截断、再恢复。** 反过来的话，_show_current() 追加的
-## 那一条会先落进表里，紧接着的截断就连它一起砍掉了
-func jump_to_history(index: int) -> bool:
+## ── 这是读档，不是 rollback ──
+## 回跳之后"未来"就不存在了：历史截断、变量贴回、音乐重播。Ren'Py 的
+## rollback 会保留一个 forward 栈让玩家再走回去，但那条路上回滚是步进式的
+## （滚轮一格退一句，容易退过头）。这里是列表点选，精确到某一条，不存在
+## 退过头 —— 所以不需要 forward，回跳就是重开一条分支。
+##
+## ── 顺序：先算数值、再截断、最后恢复位置 ──
+##   数值    要从**当前**状态往回贴，所以必须先取 index 之后那些条目
+##   截断    在 restore_snapshot() 之前：它内部 advance() 会显示目标那一句
+##           并追加历史，那一次追加会被 add() 的 sid 去重挡掉，但前提是
+##           历史已经是截断后的样子
+##   位置    最后，它把画面与台词一起换过来
+## position 是可选的**已迁移位置**。不传时用条目里记的那份 —— 同一次会话
+## 内的历史跳转，指令流没换过，它直接可用。传了就在恢复时跳过 resolve：
+## 热重载刚换过指令流，它手里那份是按新流算过的，比这里重新猜一次准
+func jump_to_history(index: int, position: Dictionary = {}) -> bool:
 	var entry := session.history().at(index)
 	if entry.is_empty():
 		return false
@@ -953,22 +1071,60 @@ func jump_to_history(index: int) -> bool:
 	# 剧本拆包之后，旧快照里的 cursor 在新指令流里没有意义。
 	# 当前全项目只有一个包，这一条永远不会命中 —— 留着是给将来拆包的护栏
 	var snapshot: Dictionary = entry.get("position", {})
+	if not position.is_empty():
+		snapshot = position
+
 	if String(snapshot.get("path", "")) != package_path:
 		push_warning("历史回跳：这一句属于另一个剧本包（%s），跳不回去"
 			% snapshot.get("path", ""))
 		return false
 
-	# 姿态取**目标历史条目**记录的那一刻，不是当前画面。
+	# ── 撤销 index 之后那些条目记录的数值变更 ──
 	#
-	# 这条区别在跨章节跳转时是决定性的：已经推进到 ep1 再跳回 ep0 第五句，
-	# 当前画面属于 ep1，从它身上抓不到第五句该有的样子。条目里那份是
-	# 当年播到第五句时存下的，和 Ren'Py 每个 checkpoint 存一份 SceneList
-	# 拷贝是同一件事
-	var poses: Dictionary = entry.get("pose", {})
+	# 从最后一条往前贴。同一条路径被改过多次时，靠后那条记的旧值才是
+	# "贴回该得到的那个值" —— 顺序反了会把更早的值写回去。
+	# 不需要基准点：贴的是绝对值，不是差值
+	var vars := session.vars_data()
+	var roles := session.roles_data()
 
+	# 还压在 journal 里的那些改动比任何历史条目都晚，所以先撤它们。
+	#
+	# 什么时候会有：玩家停在 save / pause 这类非台词指令上时，那之前的
+	# set 已经执行、但上一条历史条目早就 take_journal() 过了，于是它们
+	# 没有归属。不回卷这一段，回跳后的数值会多算
+	var pending := session.take_journal()
+	SNAPSHOT.apply_vars_delta(vars, pending["vars"])
+	SNAPSHOT.apply_roles_delta(roles, pending["roles"])
+
+	var tail := session.history().from_index(index + 1)
+	for i in range(tail.size() - 1, -1, -1):
+		SNAPSHOT.apply_vars_delta(vars, tail[i].get("vars_delta", {}))
+		SNAPSHOT.apply_roles_delta(roles, tail[i].get("roles_delta", {}))
+
+	# ── 截断并拼一份迷你快照 ──
+	#
+	# 这就是这个条目的全部内容。恢复完它，屏幕上、数值上、声音上都是
+	# "当年播到这一句时"的样子
 	session.truncate_history(index + 1)
-	restore_position(snapshot, poses)
-	return true
+
+	var snap := {
+		VNSave.F_POSITION: snapshot,
+		VNSave.F_SID: int(entry.get("sid", 0)),
+		# 历史条目不带锚点。不传 position（也就是玩家在界面里点历史）时
+		# 靠 sid 命中就够了 —— 同一次会话内指令流没换过，那一句必然还在。
+		# 真命不中（热重载之后又点了历史）就退回 label 开头，那种粗落点
+		# 是可以接受的：热重载那条路自己会传 position，用不上这里
+		VNSave.F_ANCHORS: PackedInt64Array(),
+		VNSave.F_ROLES: roles,
+		VNSave.F_STAGE: entry.get("stage", {}),
+		VNSave.F_HISTORY: session.history_data(),
+		VNSave.F_VARS: vars,
+		VNSave.F_BGM: String(entry.get("bgm", "")),
+		VNSave.F_POSE: entry.get("pose", {}),
+	}
+	# 传了位置就说明调用方已经迁移过，别再 resolve 一遍 —— 那会把一份
+	# 精确的落点重新交给启发式去估
+	return restore_snapshot(snap, {"resolved": not position.is_empty()})
 
 ###########################################################
 #  会话收尾
@@ -1005,6 +1161,8 @@ func stop_voice() -> void:
 func end_session() -> void:
 	if session != null:
 		session.clear_stage()
+		# 这一局不在了，压在 journal 里还没归属的改动也一并作废
+		session.discard_journal()
 	stop_voice()
 	_playing = false
 	# 这一局已经结束，迟到的转场结束回调不该再把游标推走
@@ -1766,10 +1924,22 @@ func _show_current() -> void:
 	var shown_text := session.interpolate(tr(text))
 	session.set_last_say_text(text)
 
-	# 姿态也在这一刻抓：这条历史指向的就是"现在这个画面"。
-	# 等玩家以后从别的章节跳回来时，抓不到这一刻 —— 那时屏幕上早换人了
+	# "这一刻"的五样东西一起抓：位置、舞台结构、姿态、音乐、数值变更。
+	#
+	# 每一样都只在当下存在：从 ep1 跳回 ep0 时，屏幕上没有第五句该有的
+	# 画面，变量表里也只有最新的值。所以不能等回跳时再取。
+	#
+	# take_journal() 取走的是"这一句之前累积的那些 set"。取走即清空，
+	# 下一句的 delta 从零开始 —— 这正是 delta 链能逐条撤销的前提
+	var journal := session.take_journal()
 	session.add_history(current_sid(), who, text, voice,
-		capture_position(), session.stage_poses())
+		capture_position(), {
+			"pose": session.stage_poses(),
+			"stage": session.stage(),
+			"bgm": audio.current_bgm() if audio != null else "",
+			"vars_delta": journal["vars"],
+			"roles_delta": journal["roles"],
+		})
 
 	line_shown.emit(shown_who, shown_text)
 

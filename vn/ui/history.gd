@@ -6,24 +6,47 @@ extends RefCounted
 #
 #  ── 为什么记在框架层 ──
 #    唯一的事件源是 VNPlayer._show_current()，那里同时握着说话人、原文、
-#    语音路径和位置快照，四样都是历史要的。而 line_shown 信号只发
-#    (who, text)，少了语音 —— 界面层从信号里根本凑不出完整的一条。
+#    语音路径、位置快照、舞台结构、姿态、当前音乐，以及这一句之前累积的
+#    变量变更 —— 全是历史要的。而 line_shown 信号只发 (who, text)，
+#    其余什么都带不出来，界面层从信号里根本凑不出完整的一条。
 #
-#  ── 条目的五个字段 ──
-#    sid       去重用，见 add()
-#    who       说话人显示名。旁白为空串
-#    text      台词**原文**，带 BBCode。剥成纯文本是显示层的事
-#    voice     语音路径。空串表示这条没有语音
-#    position  capture_position() 的快照，回跳用
+#  ── 条目的字段 ──
+#    sid          去重用，见 add()
+#    who          说话人显示名。旁白为空串
+#    text         台词**原文**，带 BBCode。剥成纯文本是显示层的事
+#    voice        语音路径。空串表示这条没有语音
+#    position     capture_position() 的快照，回跳用
+#    stage        这一句显示时的舞台结构快照，回跳用
+#    pose         这一句开始时舞台的姿态快照，回跳用
+#    bgm          这一句显示时正在播的背景音乐路径，空串表示没有音乐
+#    vars_delta   这一句显示**之前**那段时间里被改过的变量 → 改之前的旧值
+#    roles_delta  同上，角色属性
+#
+#  ── 为什么舞台与数值要跟着每一条走 ──
+#  回跳要回到"那句的画面与数值"。画面只有那一刻有：从 ep1 跳回 ep0 时，
+#  当前画面属于 ep1，抓不到第五句该有的样子。数值同理 —— 只恢复位置的话，
+#  玩家会回到过去而好感度还是未来的值。
+#
+#  这与 Ren'Py 每个 checkpoint 存一份 SceneList 拷贝、以及 store 的 delta
+#  （rollback.py:273 / :281）是同一件事。区别只在规模：那边是每条语句都存，
+#  这边只存能停下来的台词，且舞台只存结构不存纹理。
+#
+#  ── delta 为什么记旧值而不是运算 ──
+#  回跳时不需要理解 += / -=，把旧值整份贴回去就行。这样剧本里将来加别的
+#  运算符，撤销逻辑一行都不用改。函数的逆运算不需要知道函数怎么算的。
 #
 #  ── 为什么存原文而不是存剥好的纯文本 ──
 #    历史界面现在要纯文本，但那是**显示层的选择**。数据保持原样，
 #    将来想让历史保留富文本效果时，不用动数据和序列化格式。
 #
 #  ── 可序列化 ──
-#    to_data() / from_data() 是给存档系统留的口子。存档还没做，格式先定
-#    下来：一个 Array，每项是五个字段的字典。Dictionary 本身就能被
-#    var_to_bytes 处理，不需要额外编码
+#    to_data() / from_data() 是给存档系统留的口子。格式是一个 Array，
+#    每项是一条记录的字典。Dictionary 本身就能被 var_to_bytes 处理，
+#    不需要额外编码。
+#
+#    条目形状变了（多了 stage / delta）时，存档格式版本跟着 +1，旧档在
+#    VNSave 那一层就被挡住 —— 本项目还在开发期，不做条目级迁移。读取方
+#    因此可以假定字段齐全，不必到处判 has()
 # ═══════════════════════════════════════════════════════════
 
 ## 条目列表。索引 0 是最旧的一条
@@ -39,8 +62,16 @@ var _entries: Array[Dictionary] = []
 ## 才做 tr() —— 这样切语言之后整份历史可以跟着重译，
 ## 而不是永远停在记录当时那门语言上。
 ##
-## 旧存档里的条目可能是译文（早期版本存的），显示端 tr() 查不到会
-## 原样返回，两种格式可以共存
+## moment 是"这一刻"的五样东西，由 VNPlayer._show_current() 当场抓好：
+##   pose         各 tag 的显示姿态（位置 / 缩放 / 旋转 / 透明度）
+##   stage        舞台结构（谁在台上、什么形态、哪一层）
+##   bgm          正在播的曲子，空串表示当时确实没有音乐
+##   vars_delta   这一句之前被改过的变量 → 旧值
+##   roles_delta  同上，角色属性
+##
+## 为什么不让 add() 自己去取：这些东西只有播放器与显示层握得住，
+## 而"取的那一刻"必须正好是这句台词落地的这一帧。晚一帧就抓到下一句的
+## 画面了，早一帧舞台还没跟上这条 show。
 ##
 ## 去重的判据是 sid 与本列表**最后一条**相同。为什么需要它：
 ## restore_position() 会重新显示当前句，而回跳正是走它 —— 不去重的话，
@@ -49,9 +80,16 @@ var _entries: Array[Dictionary] = []
 ## 只比最后一条、不做全表去重：loop 回到之前的 label 是合法写法，
 ## 那时同一句确实该再记一次，全表去重会把这类正常情况一起吃掉
 func add(sid: int, who: String, text: String, voice: String,
-		position: Dictionary, pose: Dictionary = {}) -> bool:
+		position: Dictionary, moment: Dictionary) -> bool:
 	if not _entries.is_empty() and int(_entries[-1].get("sid", 0)) == sid:
 		return false
+
+	# 逐项深拷。moment 里的两张 delta 表是 VNSession 刚交出来的活引用，
+	# 不拷的话之后那次 take_journal() 之前的写入会改到已经归档的条目
+	var stage: Dictionary = moment.get("stage", {})
+	var pose: Dictionary = moment.get("pose", {})
+	var vars_delta: Dictionary = moment.get("vars_delta", {})
+	var roles_delta: Dictionary = moment.get("roles_delta", {})
 
 	_entries.append({
 		"sid": sid,
@@ -59,9 +97,11 @@ func add(sid: int, who: String, text: String, voice: String,
 		"text": text,
 		"voice": voice,
 		"position": position.duplicate(true),
-		# 这一句开始时舞台的样子。历史跳转回到的正是这一刻 ——
-		# 不能等到跳转时再去抓，那时画面可能已经是后面章节的了
+		"stage": stage.duplicate(true),
 		"pose": pose.duplicate(true),
+		"bgm": String(moment.get("bgm", "")),
+		"vars_delta": vars_delta.duplicate(true),
+		"roles_delta": roles_delta.duplicate(true),
 	})
 
 	var limit := VNSettings.get_current().history_length
@@ -104,6 +144,19 @@ func at(index: int) -> Dictionary:
 	if index < 0 or index >= _entries.size():
 		return {}
 	return _entries[index].duplicate(true)
+
+## 取 [from, 末尾] 的条目（深拷），按原顺序。
+##
+## 回跳要用它撤销 from 之后那些条目记录的变量/角色属性变更。从末尾往前
+## 遍历由调用方控制 —— 这里只按时间顺序交出去。
+##
+## from 越界时返回空数组而不是报错：回跳最后一条时 from 就等于 size，
+## 那种情况下"没有要撤销的东西"正是正确答案
+func from_index(from: int) -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	for i in range(maxi(from, 0), _entries.size()):
+		out.append(_entries[i].duplicate(true))
+	return out
 
 ###########################################################
 #  序列化

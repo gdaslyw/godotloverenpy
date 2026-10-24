@@ -31,6 +31,10 @@ extends Node
 #  角色属性
 ###########################################################
 
+## 快照里 delta 的撤销逻辑。纯静态函数库，走 preload 而不是 class_name ——
+## 理由见那个文件的头注释
+const SNAPSHOT := preload("res://vn/snapshot.gd")
+
 ## 剧本能改的角色属性白名单。**全项目只有这一份** —— vn/dev/parser.gd
 ## 直接引用它做编译期校验，两边不会走散。
 ##
@@ -63,6 +67,17 @@ var _roles: Dictionary = {}
 ## 类型固定四种：int / float / String / bool，由 parser 在编译期钉死，
 ## 这里不做类型推断
 var _vars: Dictionary = {}
+
+## 变量与角色属性的**变更日志**：这一句显示之前被改过的路径，在改之前的值。
+##
+## 历史回跳要回到"那一句的数值"。全量快照 × 250 条会让存档胖几十倍，所以
+## 记 delta —— 与 Ren'Py 的 Rollback.stores（rollback.py:281）同构：那边
+## 也是 (变量名, 旧值)，回滚时整份贴回去（rollback.py:424）。
+##
+## 两张表分开，是因为写入路径本来就分两处：变量在 _vars，角色属性在 _roles。
+## 合成一张要额外带"这是哪一类"的标记，读的人还得再分一次。
+var _var_journal: Dictionary = {}
+var _role_journal: Dictionary = {}
 
 ## 文本插值的占位符。匹配 [名字]：
 ##   [gold] / [route.mao.affection] / [艾玛好感]
@@ -194,6 +209,7 @@ func set_character_property(character_id: String, prop: String, value: String) -
 		props = {}
 		_roles[character_id] = props
 
+	_journal_role(character_id, prop, String(props.get(prop, "")))
 	props[prop] = value
 
 ## 导出**会变**的角色属性（深拷）。存档写它，读档还原它。
@@ -266,7 +282,25 @@ func set_var(path: String, value: Variant, how: String, notify := true) -> void:
 	node[leaf] = next
 
 	if notify and next != old:
+		_journal_var(path, old)
 		var_changed.emit(path, next)
+
+## 记一笔变量变更。同一个路径在一次结算周期里只记第一次的旧值 ——
+## 撤销要贴回的是"这一句开始之前"的值，不是中间某一步的值。
+##
+## notify=false 的写入（reset_vars、读档恢复、default 补齐）不走这里：
+## 那些是"建立初值"，不是玩家玩出来的改动，不该进历史
+func _journal_var(path: String, old: Variant) -> void:
+	if _var_journal.has(path):
+		return
+	_var_journal[path] = old
+
+## 记一笔角色属性变更。键的形状与 set 的点路径一致，回跳时不再拆解
+func _journal_role(character_id: String, prop: String, old: String) -> void:
+	var key := character_id + "." + prop
+	if _role_journal.has(key):
+		return
+	_role_journal[key] = old
 
 ## 变量在不在。变量不存 null，所以 null 等价于"没有"
 func has_var(path: String) -> bool:
@@ -298,6 +332,52 @@ func restore_vars(saved: Variant) -> void:
 ## 清空变量。开新局时用 —— 上一局的变量不能漏进下一局
 func clear_vars() -> void:
 	_vars = {}
+	discard_journal()
+
+## 按点路径删掉一个变量。撤销"这条变量当时还不存在"时用。
+##
+## 与 set_var 的补层规则相反：中间层缺了就说明路径本来就不在，安静返回。
+## 实现借用 vn/snapshot.gd 的 erase_path()，让"路径怎么拆"只有一份代码
+func erase_var(path: String) -> void:
+	SNAPSHOT.erase_path(_vars, path)
+
+## 取走这一段时间累积的变更日志并清空。
+##
+## 调用点是 VNPlayer._show_current()：一条历史条目落地时，它前面的那些
+## set 就已经全部发生过了，那些改动归这一条记录。
+##
+## 返回 { "vars": { 路径: 旧值 }, "roles": { "<id>.<属性>": 旧值 } }。
+## 没有变更时两张表都是空的 —— 绝大多数句子如此，调用方不必特判。
+##
+## 拿到的两张表可以安全地交给历史条目持有：本函数立刻换了两张新表，
+## 之后这里的写入不会再改到它们
+func take_journal() -> Dictionary:
+	var out := {"vars": _var_journal, "roles": _role_journal}
+	_var_journal = {}
+	_role_journal = {}
+	return out
+
+## 把一份已经归档的变更日志并回当前日志里。
+##
+## 热重载用：它有时要把历史最后一条截掉、让 _show_current() 重写一遍，而
+## 那条记录里存着"这一句之前被改过的量"。直接丢掉的话，将来回跳到这一句
+## 时那些改动就撤不回来了。并回去之后，重写出来的条目会带着它们。
+##
+## 已经存在的路径不覆盖：那说明这一段时间里它又被改过一次，而**更早**的
+## 那个旧值才是回跳要贴回去的
+func merge_journal(vars_delta: Dictionary, roles_delta: Dictionary) -> void:
+	for path in vars_delta:
+		if not _var_journal.has(path):
+			_var_journal[path] = vars_delta[path]
+	for key in roles_delta:
+		if not _role_journal.has(key):
+			_role_journal[key] = roles_delta[key]
+
+## 丢弃累积的变更日志。开新局、读档、热重载之前用 ——
+## 那些改动属于上一段剧情，不该算进下一句
+func discard_journal() -> void:
+	_var_journal = {}
+	_role_journal = {}
 
 ## 按 default 表重建变量：先清空，再逐条灌初值。
 ##
@@ -306,6 +386,9 @@ func clear_vars() -> void:
 ## 把变量打回初值，那会抹掉玩家已经积累的数
 func reset_vars(defaults: Array) -> void:
 	_vars = {}
+	# 上一局的变更日志也不能留：它的旧值指向的是上一局的变量表，
+	# 回跳时贴回去会写进一堆这一局根本没有的路径
+	discard_journal()
 	for d in defaults:
 		if not (d is Dictionary):
 			continue
@@ -505,7 +588,13 @@ func finish_tag(tag: String) -> void:
 ## 节点一重建（scene 之后重新 show、界面换掉再挂回来）状态就丢了
 ##
 ## at / atl 是**覆盖**而不是累加：它们描述的是"这一条 show 用哪套动画"，
-## 每次 show 都给出完整答案。没写 at 就是空串，由显示层按默认的 xycenter 处理
+## 每次 show 都给出完整答案；没写就是空串。
+##
+## 空串在显示层有两种处理，不是一律回默认居中：
+##   · 新建节点、以及属性没变的纯 show → 用默认 xycenter 居中
+##   · 原地换外观（L2D 表情、层叠式换层）→ 保持当前动画与位置
+## 判据见 stage.gd 的 _apply_stage()。所以"没写 at"只说明这条 show 没有
+## 提出新的定位要求，不代表要把内容挪回中心
 func show_tag(tag: String, attrs: String, front: bool,
 		at_name: String = "", atl: String = "") -> void:
 	if tag.is_empty():
@@ -654,11 +743,13 @@ func history() -> VNHistory:
 
 ## 追加一条历史。由 VNPlayer._show_current() 调用。
 ##
-## pose 是这一句开始时舞台的姿态。历史跳转要回到"那句的画面"，而画面
-## 只存在于当时那一帧 —— 从 ep1 跳回 ep0 时，当前画面里根本没有旧信息可抓
+## moment 是"这一刻"的五样东西 —— 舞台结构、姿态、音乐、变量与角色属性的
+## 变更日志。它们只存在于这一帧：从 ep1 跳回 ep0 时，当前屏幕上没有第五句
+## 该有的画面，也拿不到当时的数值。所以由播放器当场抓好交进来，历史只负责
+## 存。字段含义见 VNHistory.add()
 func add_history(sid: int, who: String, text: String, voice: String,
-		position: Dictionary, pose: Dictionary = {}) -> bool:
-	return _history.add(sid, who, text, voice, position, pose)
+		position: Dictionary, moment: Dictionary) -> bool:
+	return _history.add(sid, who, text, voice, position, moment)
 
 ## 把历史截断到前 count 条。回跳后由 VNPlayer.jump_to_history() 调用
 func truncate_history(count: int) -> void:

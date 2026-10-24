@@ -12,10 +12,12 @@ extends CanvasLayer
 #    "lili 的 1 号立绘在哪个文件"是内容，"L2D 模型怎么驱动"是技术选型，
 #    框架两个都不该知道。VN 只传 tag 和 attrs 下来。
 #
-#  扩展方式：继承本类覆写 resolve()。
-#    静态图和视频是框架自带的实现（纯资源约定，无外部依赖）；
-#    层叠式和 L2D 各自是一份覆写，接上去不动 _stage、不动指令语义、
-#    更不动剧本一个字。
+#  三个后端都是框架自带的实现：
+#    静态图 / 视频  纯资源约定，无额外文件
+#    层叠式         一个 portrait.tscn，见 portrait_layered.gd
+#    L2D            目录里放模型，见 portrait_cubism.gd
+#  接上去不动 _stage、不动指令语义、更不动剧本一个字。
+#  要加第四个后端：继承本类覆写 resolve()。
 #
 #  ── 每个内容独占一个 CanvasLayer，而不是直接挂在本层下 ──
 #    排序用 CanvasLayer.layer，不用 CanvasItem.z_index。原因是 L2D 会给
@@ -100,6 +102,10 @@ const ALPHA_TEXTURE_PADDING := 0.02
 ## 新脚本第一次被引用时编辑器/headless 都可能还没扫到它
 const ATL_SCRIPT := preload("res://vn/ui/atl.gd")
 
+## 层叠式立绘后端。同样用 preload：它是新增文件，而玩家有可能在编辑器
+## 扫到类名之前就跑到了 show
+const LAYERED_PORTRAIT := preload("res://vn/ui/portrait_layered.gd")
+
 ## 舞台内容：tag → { "layer", "node", "inner", "at", "atl", "atl_player" }。
 ## 存包装层而不是直接存内容节点，因为销毁、换层都是对包装层操作。
 ## node 是屏幕上可整体调透明度的节点，inner 是真正的内容 —— 没有包装时两者相同
@@ -114,6 +120,18 @@ var _entries: Dictionary = {}
 ## 它的存在是为了让热重载 / 历史跳转后的画面停在"原来那个位置"，
 ## 而不是被默认的 xycenter 拽回舞台中心
 var _saved_transforms: Dictionary = {}
+
+## 这一次 _apply_stage() 是不是"恢复"而不是"演出"。
+##
+## stage_rebuilt 只在一件事发生时发：位置被整体搬走了（读档、历史跳转、
+## 热重载、重放）。紧随其后的那次 _apply_stage() 建出来的节点，代表
+## "那一刻本来就在画面上"的东西，而不是"刚刚被 show 出来"的东西 ——
+## 后者可以演一遍入场，前者不行。
+##
+## 目前唯一吃这个标志的是雨：它的 setup() 会按属性里的秒数从透明淡入，
+## 那是给"剧本第一次 show 它"用的。恢复时若照做，读档后会看到雨重新
+## 下起来，而不是它当时已经下的那个强度
+var _restoring_stage := false
 ## 是否已经就"图像表为空"警告过一次。
 ## 每次解析图像都会查表，不加这个标志会在整场剧情里反复刷同一条
 var _images_warned := false
@@ -131,6 +149,18 @@ var _pending_before: Array[Node] = []
 var _pending_active := false
 ## 建立待转场的那一帧。下一帧还没被消费就丢弃
 var _pending_frame := -1
+
+## 是否已经排了一次"帧末默认淡化"（见 _queue_default_fade）。
+## 一次 advance 里可能连着 show 好几个，排一次就够
+var _default_fade_queued := false
+
+## 后台默认淡化的进度。它不阻塞剧本、不可跳过，所以不走 VNTransition ——
+## 那套带输入闸门，转场期间要把玩家点击吞掉；而这里正相反，淡化在跑的
+## 时候台词照常推进
+var _fade_duration := 0.0
+var _fade_elapsed := 0.0
+var _fade_show: Array[Node] = []
+var _fade_hide: Array[Node] = []
 
 ###########################################################
 #  预加载池
@@ -205,6 +235,14 @@ func _on_stage_changed(stage: Dictionary) -> void:
 ## 代价是 L2D 要重新加载模型（几百毫秒）。开发期独有的操作，
 ## 用它换掉一整类"状态残留"的 bug 是划算的
 func _on_stage_rebuilt() -> void:
+	# 接下来那次 _apply_stage() 是"摆回原样"，不是"演出入场"。
+	# 标志在这里置、在那次对齐的末尾清 —— 中间不会有别的 _apply_stage()
+	# 插进来，因为 restore_stage() 是先发 rebuilt 再发 changed 的
+	_restoring_stage = true
+
+	# 后台淡化握着的层马上要被销毁，先收到终态并清空引用
+	_settle_layer_fade()
+
 	# 待转场的旧节点不在 _entries 里，得单独清一遍，
 	# 否则重建之后它们会永远留在舞台上
 	_drop_pending()
@@ -303,6 +341,11 @@ func _apply_pose(node: Node, saved: Dictionary) -> void:
 ## 只有 order 变的只改 layer。全量重建会让视频重新加载、立绘闪一下 ——
 ## 而 stage_changed 在 scene 之后常常连发好几次（连续 show）
 func _apply_stage(stage: Dictionary) -> void:
+	# 这一次是不是"摆回原样"。取一次就清 —— 这个标志只覆盖紧随
+	# stage_rebuilt 的那一份状态，之后的 show 一律按正常演出处理
+	var instant := _restoring_stage
+	_restoring_stage = false
+
 	# 变化之前的节点集合。转场时"哪些是新出现的"就靠它区分
 	var before := _content_nodes()
 	var changed := false
@@ -325,7 +368,7 @@ func _apply_stage(stage: Dictionary) -> void:
 		var pose: Dictionary = entry.get("pose", {})
 
 		if not _entries.has(tag):
-			_add_entry(tag, attrs, order, at_name, atl, pose)
+			_add_entry(tag, attrs, order, at_name, atl, pose, instant)
 			changed = true
 			continue
 
@@ -340,7 +383,31 @@ func _apply_stage(stage: Dictionary) -> void:
 			if _try_update_attrs(inner, attrs):
 				inner.set_meta("vn_attrs", attrs)
 				_set_layer(e["layer"], order)
-				_maybe_restart_atl(e, at_name, atl)
+
+				# 按层换外观的后端（见 portrait_layered.gd）会报出这一轮
+				# 哪些层由隐变显、哪些由显变隐。出路有两条：
+				#   紧跟 with dissolve → 舞台转场把这批层并进同一次淡化
+				#   没有 with          → 帧末按 portrait_dissolve_time 自动淡
+				# 记录带帧号：隔了帧的旧变化不会被后面的 with 误用
+				var layers := _take_transition_layers(inner)
+				if not layers.is_empty():
+					e["transition"] = layers
+					e["transition_frame"] = Engine.get_process_frames()
+					# 帧末若仍没有 with 来消费，就用立绘的默认时长淡过去
+					_queue_default_fade()
+
+				# 只换外观、且这一条 show 没写 at 也没写内联块时，**不动**当前
+				# 动画与位置。"换表情"是极常见的 show，若每次都退回默认的
+				# xycenter，画面会在切表情的瞬间跳一下 —— 玩家只会觉得
+				# "立绘抖了"，而原因藏在"这一条 show 没写 at"里。
+				#
+				# 只在**原地更新**这一支跳过硬重启，是有意的：
+				#   · 纯 show（属性没变，见下面的 else）仍然保留"没写 at 就
+				#     回默认居中"这条既有语义 —— ATL 测试靠它在换动画前复位
+				#   · 显式给了 at / 内联块的 show 照常重启，不受影响
+				# 所以这不是无条件 sticky：位置只在"外观更新"时被保留
+				if not at_name.is_empty() or not atl.is_empty():
+					_maybe_restart_atl(e, at_name, atl)
 				continue
 
 			# 静态图换属性就是换张贴图，视频重新加载会从头播 ——
@@ -348,9 +415,12 @@ func _apply_stage(stage: Dictionary) -> void:
 			# 重建要连包装层一起换掉：内容节点换了，包装层没有复用的理由
 			_entries.erase(tag)
 			_keep_leaving(e)
-			_add_entry(tag, attrs, order, at_name, atl, pose)
+			_add_entry(tag, attrs, order, at_name, atl, pose, instant)
 			changed = true
 		else:
+			# 属性没变：这条 show 只可能是在要求一次完整定位（复位、换动画），
+			# 所以没写 at 时照旧回默认居中 —— 与上面"只换外观"那一支相反。
+			# 两条路的判据不同，是有意的：改变外观不等于要改变位置
 			_set_layer(e["layer"], order)
 			_maybe_restart_atl(e, at_name, atl)
 
@@ -380,10 +450,13 @@ func _try_update_attrs(node: Node, attrs: String) -> bool:
 ##
 ## pose 是读档带回来的姿态。热重载不走它（那边从旧节点现抓一份，
 ## 见 _saved_transforms），两条路径最后都汇到 _apply_pose()
+##
+## instant 是"这是摆回原样，不是 show 出来"。只有需要入场过渡的内容
+## 才关心它，见 resolve()
 func _add_entry(tag: String, attrs: String, order: int,
 		at_name: String = "", atl: String = "",
-		pose: Dictionary = {}) -> void:
-	var node := resolve(tag, attrs.split(" ", false))
+		pose: Dictionary = {}, instant: bool = false) -> void:
+	var node := resolve(tag, attrs.split(" ", false), instant)
 	if node == null:
 		push_warning("舞台上没有可显示的东西：\"%s %s\"" % [tag, attrs])
 		return
@@ -678,7 +751,13 @@ func _disable_mouse(node: Node) -> void:
 #       拿 _pending_before 之外的新节点当新画面
 #    3. 转场结束销毁旧包装层，通知播放器继续
 #
-#  没有被 with 消费的变化在下一帧由 _process 丢弃 —— 普通 show / scene
+#  原地换外观（L2D 换表情、层叠式换层）不产生新旧节点，所以另有一条路：
+#  后端用 transition_layers() 报出这一轮变了可见性的层。
+#    with_run 到达时 → _play_layer_transition 把这些层并进这次交叉淡化
+#    没有 with      → 帧末 _run_default_fade 按 portrait_dissolve_time
+#                     自动淡过去，且不阻塞剧本（玩家可以立刻继续推进）
+#
+#  没有被 with 消费的节点变化在下一帧由 _process 丢弃 —— 普通 show / scene
 #  仍然是瞬时切换，行为和加 with 之前完全一样
 ###########################################################
 
@@ -689,6 +768,7 @@ func _disable_mouse(node: Node) -> void:
 ## 但至少不会连着卡好几帧
 func _process(delta: float) -> void:
 	_update_atl(delta)
+	_update_layer_fade(delta)
 
 	if not _prefetch_queue.is_empty():
 		_build_prefetched()
@@ -705,8 +785,10 @@ func _process(delta: float) -> void:
 
 ## 播放器报来一批"接下来会 show 的内容"。
 ##
-## 按后端分两路：
+## 按后端分三路：
 ##   cubism          进池，由 _process 每帧建一个（加载是同步的，几百毫秒）
+##   layered         后台预读 portrait.tscn：场景加载会把依赖的贴图一起带进来，
+##                   之后实例化时不再碰磁盘
 ##   静态立绘 / 图 / 视频  只需一次后台预读，交给资源加载器就行
 ##
 ## 认不出来的 tag 一律忽略 —— 预取是尽力而为，真正 show 时该报的错照报
@@ -729,9 +811,15 @@ func _on_prefetch_requested(requests: Array) -> void:
 ##
 ## 这条路径只服务于预读 —— 真正的解析仍然走 resolve()。两边算得不一样
 ## 最多是多读一个文件或少读一个，不会让画面出错
+##
+## layered 返回整份场景而不是某张图：层的贴图在场景里，而 Godot 加载
+## PackedScene 时会连带把它的 ext_resource 一起读进来
 func _asset_path(tag: String, attrs: PackedStringArray, kind: String) -> String:
 	if kind == "static":
 		return _portrait_path(tag, attrs)
+
+	if kind == "layered":
+		return LAYERED_PORTRAIT.scene_path(tag)
 
 	var id := tag
 	for a in attrs:
@@ -899,19 +987,41 @@ func _destroy_layer(layer_: Node) -> void:
 		return
 	layer_.queue_free()
 
-## 剧本请求一次舞台转场。没有待转场的变化时（例如 with 前面什么都没改）
-## 直接放行 —— 延到帧末是因为此刻还在播放器的 advance() 调用栈里，
+## 剧本请求一次舞台转场。
+##
+## 三种来源，按优先级：
+##   新出现 / 消失的节点（_pending_active，原有的路径）
+##   原地换外观产生的层变化（层叠式这类后端自己报的，见 _take_transition_layers）
+##   两者都没有 → 直接放行，这条 with 什么也不做
+##
+## 延到帧末是因为此刻还在播放器的 advance() 调用栈里，
 ## 同步 resume 会让 advance() 递归下去
 func _on_stage_transition(transition: String, params: Array,
 		serial: int) -> void:
-	if not _pending_active:
+	# 层变化只在这条 with 里有效，无论走哪条路都先取出来
+	var layers := _collect_transition_layers()
+
+	if _pending_active:
+		_play_transition(transition, params, serial, layers)
+		return
+
+	if layers.is_empty():
 		VN.resume_transition.call_deferred(serial)
 		return
-	_play_transition(transition, params, serial)
 
-## 执行一次转场。消费掉 _leaving 与 _pending_before，结束后销毁旧节点并放行播放器
+	# 只有"换外观"、没有新节点：把变化的层自己交叉淡化
+	_play_layer_transition(transition, params, layers, serial)
+
+## 执行一次转场。消费掉 _leaving 与 _pending_before，结束后销毁旧节点并放行播放器。
+##
+## layers 是原地换外观留下的 { "show": [...], "hide": [...] }：
+## 它们和新旧节点一起进同一次淡化，这样"换表情同时换布景"这类混合变化
+## 也能一次做完
 func _play_transition(transition: String, params: Array,
-		serial: int) -> void:
+		serial: int, layers: Dictionary = {}) -> void:
+	# 后台默认淡化不该和舞台转场抢同一批层的 alpha
+	_settle_layer_fade()
+
 	# 先摘下来：转场期间 _process 不能再清理它们
 	var leaving := _leaving
 	var before := _pending_before
@@ -939,6 +1049,8 @@ func _play_transition(transition: String, params: Array,
 		if node is CanvasItem and is_instance_valid(node):
 			to_show.append(node)
 
+	_merge_layer_transition(to_show, to_hide, layers)
+
 	# 画面没变（比如 show 的是当前形态）：转场无事可做，直接放行
 	if to_show.is_empty() and to_hide.is_empty():
 		_destroy_entries(leaving)
@@ -948,6 +1060,7 @@ func _play_transition(transition: String, params: Array,
 	var settings := VNSettings.get_current()
 	if not settings.transition_enabled:
 		_finish_transition(to_show)
+		_settle_layer_transition(layers)
 		_destroy_entries(leaving)
 		VN.resume_transition.call_deferred(serial)
 		return
@@ -967,8 +1080,208 @@ func _play_transition(transition: String, params: Array,
 			push_warning("未知的舞台转场：%s，按瞬时切换处理" % transition)
 			_finish_transition(to_show)
 
+	_settle_layer_transition(layers)
 	_destroy_entries(leaving)
 	VN.resume_transition.call_deferred(serial)
+
+## 只有原地换外观、没有新老节点时的转场。
+##
+## 只认 dissolve：黑场转场（fade）要先把整帧旧画面盖住再换，而原地更新
+## 没有旧画面可取，那个效果给不出来。其余转场按瞬时处理，和以前一样
+func _play_layer_transition(transition: String, params: Array,
+		layers: Dictionary, serial: int) -> void:
+	_settle_layer_fade()
+
+	var to_show: Array[Node] = []
+	var to_hide: Array[Node] = []
+	_merge_layer_transition(to_show, to_hide, layers)
+
+	if to_show.is_empty() and to_hide.is_empty():
+		VN.resume_transition.call_deferred(serial)
+		return
+
+	var settings := VNSettings.get_current()
+	var duration := settings.stage_dissolve_time
+	if transition == "dissolve" and params.size() > 0:
+		duration = float(params[0])
+
+	if transition == "dissolve":
+		await VN.transition.crossfade(to_show, to_hide, duration)
+	else:
+		_finish_transition(to_show)
+
+	_settle_layer_transition(layers)
+	VN.resume_transition.call_deferred(serial)
+
+## 排一次"帧末若仍没人消费，就按立绘默认时长淡化"。
+##
+## 用 call_deferred 而不是立刻做：同一次 advance 里 with_run 紧跟在 show
+## 后面，此刻还不知道它会不会来。with 先取走层变化的话，deferred 到时
+## 是空表，自然什么都不做
+func _queue_default_fade() -> void:
+	if _default_fade_queued:
+		return
+
+	var settings := VNSettings.get_current()
+	if not settings.transition_enabled or settings.portrait_dissolve_time <= 0.0:
+		return
+
+	_default_fade_queued = true
+	_run_default_fade.call_deferred()
+
+## 帧末的默认淡化入口。没有东西要淡（被 with 先取走了）就直接返回
+func _run_default_fade() -> void:
+	_default_fade_queued = false
+
+	var layers := _collect_transition_layers()
+	if layers.is_empty():
+		return
+
+	var duration := VNSettings.get_current().portrait_dissolve_time
+	if duration <= 0.0:
+		return
+
+	_start_layer_fade(layers, duration)
+
+## 启动一次后台淡化。上一轮还没跑完的先定死到终态 —— 两次淡化抢同一批
+## 层的 alpha 会互相覆盖，最后结束的那个说了算，结果不可预期
+func _start_layer_fade(layers: Dictionary, duration: float) -> void:
+	_settle_layer_fade()
+
+	var to_show: Array[Node] = []
+	var to_hide: Array[Node] = []
+	_merge_layer_transition(to_show, to_hide, layers)
+	if to_show.is_empty() and to_hide.is_empty():
+		return
+
+	_fade_show = to_show
+	_fade_hide = to_hide
+	_fade_duration = maxf(duration, 0.0001)
+	_fade_elapsed = 0.0
+
+	for node in _fade_show:
+		VNTransition.set_alpha(node, 0.0)
+	for node in _fade_hide:
+		VNTransition.set_alpha(node, 1.0)
+
+## 逐帧推进后台淡化。
+##
+## 不用 Tween 是为了节点在淡化途中被 hide / 重建时能逐帧判有效 ——
+## Tween 打到已释放的节点上只会在控制台留下一串错
+func _update_layer_fade(delta: float) -> void:
+	if _fade_duration <= 0.0:
+		return
+
+	_fade_elapsed += delta
+	var t := clampf(_fade_elapsed / _fade_duration, 0.0, 1.0)
+
+	for node in _fade_show:
+		if is_instance_valid(node):
+			VNTransition.set_alpha(node, t)
+	for node in _fade_hide:
+		if is_instance_valid(node):
+			VNTransition.set_alpha(node, 1.0 - t)
+
+	if t >= 1.0:
+		_settle_layer_fade()
+
+## 立刻把后台淡化收到终态。
+##
+## 舞台 with 的层淡化开始前也要调一次：两套淡化同时改同一批层时，
+## 后结束的那个会盖掉前一个的终值
+func _settle_layer_fade() -> void:
+	for node in _fade_hide:
+		if node is CanvasItem and is_instance_valid(node):
+			(node as CanvasItem).visible = false
+			VNTransition.set_alpha(node, 1.0)
+
+	for node in _fade_show:
+		if node is CanvasItem and is_instance_valid(node):
+			VNTransition.set_alpha(node, 1.0)
+
+	_fade_show.clear()
+	_fade_hide.clear()
+	_fade_duration = 0.0
+	_fade_elapsed = 0.0
+
+## 从内容节点取走它这一轮报告的层变化。没实现 transition_layers() 的后端
+## （静态图、L2D）返回空字典 —— 它们换外观要么重建节点、要么本来就是瞬时，
+## 走不到这条路上
+func _take_transition_layers(inner: Node) -> Dictionary:
+	if not inner.has_method("transition_layers"):
+		return {}
+
+	var value = inner.call("transition_layers")
+	if not (value is Dictionary):
+		return {}
+
+	var show_layers: Array = (value as Dictionary).get("show", [])
+	var hide_layers: Array = (value as Dictionary).get("hide", [])
+	if show_layers.is_empty() and hide_layers.is_empty():
+		return {}
+
+	return {"show": show_layers, "hide": hide_layers}
+
+## 汇总所有条目里待消费的层变化，并清空。
+##
+## 只认同**一帧**里记下的变化：一条 show 和它的 with 在同一次 advance 里
+## 执行，必然同帧。隔了帧的（比如 show 之后先过一句台词，再来一个独立 with）
+## 不属于这条 with —— 不这样判的话，很久以前换过的表情会被重新淡一遍
+func _collect_transition_layers() -> Dictionary:
+	var show_layers: Array = []
+	var hide_layers: Array = []
+	var frame := Engine.get_process_frames()
+
+	for tag in _entries:
+		var entry: Dictionary = _entries[tag]
+		var pending = entry.get("transition", {})
+		var at_frame := int(entry.get("transition_frame", -1))
+		entry.erase("transition")
+		entry.erase("transition_frame")
+
+		if at_frame != frame:
+			continue
+		if not (pending is Dictionary):
+			continue
+		show_layers.append_array((pending as Dictionary).get("show", []))
+		hide_layers.append_array((pending as Dictionary).get("hide", []))
+
+	# 空表返回空字典：调用方用 is_empty() 判断"有没有东西要淡"，
+	# 带两个空数组的字典不算空
+	if show_layers.is_empty() and hide_layers.is_empty():
+		return {}
+	return {"show": show_layers, "hide": hide_layers}
+
+## 把层变化并进这次转场的节点列表。
+##
+## 淡出的层要先临时设为可见：apply_attrs 已经把它藏起来了，而 crossfade
+## 需要它从 alpha 1 开始往 0 走。收起放在 _settle_layer_transition() ——
+## 转场结束之前它必须留在屏幕上参与淡化
+func _merge_layer_transition(to_show: Array[Node], to_hide: Array[Node],
+		layers: Dictionary) -> void:
+	for node in layers.get("hide", []):
+		if node is CanvasItem and is_instance_valid(node):
+			(node as CanvasItem).visible = true
+			to_hide.append(node as Node)
+
+	for node in layers.get("show", []):
+		if node is CanvasItem and is_instance_valid(node):
+			to_show.append(node as Node)
+
+## 转场结束后把淡出的层收起来，并把 alpha 复位。
+##
+## alpha 必须复位：crossfade 把它补到了 0，藏着的时候看不出来，
+## 下次这个层被属性重新选中时会以 alpha 0 出现 —— 看起来像"没显示"，
+## 而 visible 明明是对的，这种错最难查
+func _settle_layer_transition(layers: Dictionary) -> void:
+	for node in layers.get("hide", []):
+		if node is CanvasItem and is_instance_valid(node):
+			(node as CanvasItem).visible = false
+			VNTransition.set_alpha(node, 1.0)
+
+	for node in layers.get("show", []):
+		if node is CanvasItem and is_instance_valid(node):
+			VNTransition.set_alpha(node, 1.0)
 
 ## 黑场转场：旧画面淡到中间色 → 换画面 → 从中间色淡入新画面。
 ## 新内容在遮罩底下提前就位，全黑那一刻才显示，玩家看不到切换的瞬间
@@ -1023,11 +1336,16 @@ func _destroy_entries(entries: Array) -> void:
 ##
 ## 覆写本方法即可接入新的后端。覆写时建议先调 super() 或自己完整分派，
 ## 两种都行 —— 这里没有任何隐藏状态
-func resolve(tag: String, attrs: PackedStringArray) -> Node:
+##
+## instant 为 true 表示"这是一次恢复"（读档 / 历史跳转 / 热重载），内容
+## 应当直接呈现那一刻的样子，不要演一遍"第一次出现"的入场。目前只有雨
+## 用得上它 —— 别的内容没有入场过渡，参数自然被忽略
+func resolve(tag: String, attrs: PackedStringArray,
+		instant: bool = false) -> Node:
 	# 内置显示物优先于图像表。名字被占用了就是占用了 ——
 	# 将来真的往 content/images/ 里放一张 rain.png，也压不过这一支
 	if tag == RAIN_TAG:
-		return _make_rain(attrs)
+		return _make_rain(attrs, instant)
 
 	var kind := VN.character_property(tag, "portrait_kind")
 	if kind.is_empty():
@@ -1037,21 +1355,33 @@ func resolve(tag: String, attrs: PackedStringArray) -> Node:
 ## 雨。程序化生成，没有任何源文件可扫，所以不查图像表。
 ## 档位与过渡时长交给节点自己解析 —— 和 L2D 的 apply_attrs() 一样，
 ## 是"内容自己说了算"的约定
-func _make_rain(attrs: PackedStringArray) -> Node:
+##
+## instant 直接透传：恢复时那一刻的雨本来就是这个强度，不该再从透明淡入。
+## 属性里写的秒数只属于"剧本第一次 show 它"那一次
+func _make_rain(attrs: PackedStringArray, instant: bool = false) -> Node:
 	var rain := VNRain.new()
-	rain.setup(attrs)
+	rain.setup(attrs, instant)
 	return rain
 
 ## 角色立绘。按**声明的**方式分派 —— 声明是显式的，所以资源缺失时
 ## 能说出准确原因，而不是"自动判断猜错了后端"。
-## cubism 的实现见 portrait_cubism.gd
+##   layered 见 portrait_layered.gd（一个 portrait.tscn）
+##   cubism  见 portrait_cubism.gd（目录里的 .model3.json）
 func _resolve_portrait(tag: String, attrs: PackedStringArray, kind: String) -> Node:
 	match kind:
 		"static":
 			return _make_sprite(_portrait_path(tag, attrs))
 		"layered":
-			push_warning("角色 \"%s\" 声明为 layered，但层叠式后端还没实现" % tag)
-			return null
+			# 场景式层叠立绘。层的偏移、缩放、先后顺序全在 portrait.tscn 里
+			# 由作者摆好，后端只按属性切换每张的可见性。
+			#
+			# 构造失败时返回 null 而不是这个空节点：一个什么都显示不了的
+			# 节点会安静地占着舞台，报错现场却只剩一句"没有可显示的东西"
+			var layered = LAYERED_PORTRAIT.new()
+			if not layered.setup(tag, attrs):
+				layered.free()
+				return null
+			return layered
 		"cubism":
 			# 先从预加载池里取。取到的是已经读完 moc3 与纹理的节点，
 			# show 时省掉那几百毫秒

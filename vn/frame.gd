@@ -175,6 +175,16 @@ signal stage_prefetch_requested(requests: Array)
 ## 播放器报来一批即将播出的声音路径（语音 / 音乐 / 音效）。音频层自行决定要不要预读
 signal audio_prefetch_requested(paths: Array)
 
+## 玩家点中了台词里的 {a=值} 链接。参数是剥掉标签层前缀之后的原始值。
+##
+## 框架**不解释**这个值：http 地址不会自动开浏览器，label 名也不会自动跳 ——
+## 那两件事分别由 {url=} 与 {jump=} / {call=} 负责。收到之后要做什么，
+## 全部由订阅方决定；没人订阅时静默丢弃。
+##
+## 之所以做成信号而不是注册表：框架不该知道作品有哪些"协议"，
+## 而订阅方本来就有自己的生命周期（界面树），信号天然跟着它走
+signal link_requested(value: String)
+
 ## 玩家请求退出：点了窗口关闭按钮（或 Alt+F4），或者在安卓上按了返回键。
 ##
 ## **上面那一段的例外** —— 它没有上游子系统。源头是引擎送到本节点上的
@@ -434,6 +444,20 @@ func request_jump(label_name: String) -> void:
 ## 由界面在玩家点中台词里的 {call=} 链接时调用
 func request_call(label_name: String) -> void:
 	player.request_call(label_name)
+
+## 把台词里 {a=值} 点中时的原始值转给作品层。
+##
+## 只发信号，不碰播放器 —— 这一类链接不推进、不改位置，开不开界面、
+## 要不要存档，都是订阅方自己的事。
+##
+## 没有订阅者时给一条警告再返回，而不是静默丢弃：作者写了 {a=xxx} 却
+## 忘了接信号，玩家点下去毫无反应，那种"点了没反应"的 bug 最难查。
+## 热路径上多一次 get_connections() 无所谓 —— 一次点击一次
+func request_link(value: String) -> void:
+	if link_requested.get_connections().is_empty():
+		push_warning("台词里的扩展链接无人处理：%s" % value)
+		return
+	link_requested.emit(value)
 
 ## 舞台转场结束。显示层执行完转场后调它，让播放器继续。
 ## serial 对不上时播放器会丢弃这次回调

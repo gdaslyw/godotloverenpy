@@ -123,11 +123,15 @@ func _init() -> void:
 ## 首次 show 时写了数字就是"雨慢慢下起来"：从完全透明开始，在指定时长里
 ## 补到目标档。没写数字就瞬时出现 —— 雨第一次出现在画面上时它本来就已经
 ## 在下着了，那一下的观感该由舞台转场（with dissolve）负责
-func setup(attrs: PackedStringArray) -> void:
+##
+## instant 为 true 表示这是**恢复**（读档 / 历史跳转 / 热重载），直接到档。
+## 那一刻的雨本来就是这个强度，属性里的秒数说的是"剧本第一次 show 它时
+## 慢慢下起来"，不该在读档时重演一遍 —— 否则玩家会看到雨从零开始重新下
+func setup(attrs: PackedStringArray, instant: bool = false) -> void:
 	_build_material()
 
 	var parsed := _parse_attrs(attrs, 0.0)
-	var duration := float(parsed["duration"])
+	var duration := 0.0 if instant else float(parsed["duration"])
 	if duration > 0.0:
 		# 渐变留到 _ready()。起点设为完全透明，否则会先以默认档显形再变
 		_pending_level = String(parsed["level"])

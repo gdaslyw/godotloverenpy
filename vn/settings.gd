@@ -459,14 +459,27 @@ var window_show_time := 0.2
 var window_hide_time := 0.2
 
 ###########################################################
-#  剧本转场（with）
+#  转场时长
 #
-#  剧本里 with dissolve / with fade 不带参数时用这里的值。
-#  参数写在剧本里时覆盖它们，两边不冲突
+#  with dissolve / with fade 不带参数时用这里的值，参数写在剧本里时覆盖它们。
+#  portrait_dissolve_time 是另一类：它管的是**根本没写 with**的原地换外观
 ###########################################################
 
 ## with dissolve 的默认时长。对应 Ren'Py 的 define dissolve = Dissolve(0.5)
 var stage_dissolve_time := 0.5
+
+## 原地换外观（换表情、换装）的默认交叉淡化时长，单位秒。
+##
+## 只在"这条 show 没写 with"时使用：剧本显式写了 with dissolve 就以剧本
+## 给的为准，那是作者意图，不该被默认值盖掉。0 表示瞬时；
+## transition_enabled 总开关关闭时同样瞬时。
+##
+## 只对能按层报告变化的后端有效（层叠式立绘，见 portrait_layered.gd）。
+## L2D 的表情是模型参数、静态图是换整张贴图，两者都没有可以单独淡化的层。
+##
+## 0.25 是"看得出在过渡、又不拖慢阅读"的量级：它挂在每一次换表情上，
+## 和 stage_dissolve_time 那种一场戏只出现几次的转场不是一回事
+var portrait_dissolve_time := 0.25
 
 ## with fade 的三个时间：淡到中间画面、停留、从中间画面淡出。
 ## 对应 Ren'Py 的 define fade = Fade(.5, 0, .5)
