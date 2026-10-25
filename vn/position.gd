@@ -170,11 +170,16 @@ static func resolve(snapshot: Dictionary, sid: int, anchors: PackedInt64Array,
 		return _result(_label_index(label_start, outer), outer, [], HOW_STACK,
 			snapshot, sid_found)
 
-	# ── 一级：当前句原样还在 ──
+	# ── 一级：sid 命中 ──
+	#
+	# 不再限定"必须是台词"。sid 是跨次编译继承的持久身份，命中就说明那条
+	# 指令还在，落点是精确的 —— 比按锚点估一个更可信。
+	#
+	# 原先只认 say，前提是"玩家只能停在台词上"。menu 打破了这个前提：
+	# 选项界面出现时游标就停在 menu 上，玩家选完还会记一条历史，
+	# 回跳到那里必须精确落回 menu 本身，否则会一路退到章节开头
 	if sid_found:
-		var at := int(index[sid])
-		if is_say(ops[at]):
-			return _result(at, label_name, new_stack, HOW_SID, snapshot, true)
+		return _result(int(index[sid]), label_name, new_stack, HOW_SID, snapshot, true)
 
 	# ── 二级：往前找锚点，按回溯步数推进 ──
 	#

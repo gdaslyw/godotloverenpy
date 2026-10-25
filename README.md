@@ -7,7 +7,8 @@
 ## 环境
 - Godot 版本：v4.7.2-stable
 - 平台：Windows、Android
-- Live2D 拓展：gd_cubism 0.9.1（需自行编译）
+- Live2D 拓展：gd_cubism 0.9.1
+- Steam 拓展：GodotSteam GDExtension 4.23.2
 
 ## 最短可跑路径
 - 把仓库里的 vn/ 目录复制到工程的 res:// 下
@@ -20,5 +21,6 @@
 - Ren'Py：设计参考，MIT；本项目为独立重写，未包含其源码
 - gd_cubism：Live2D 后端
 - Live2D：本仓库不打包 SDK / Core / 模型，使用受其协议约束
+- GodotSteam：Steam 后端
 
 MIT © 2026 孤独爱上了夜晚，见 LICENSE。

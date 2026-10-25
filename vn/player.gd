@@ -91,6 +91,23 @@ signal window_action_requested(target_visible: bool, transition_name: String, pa
 ## advance() 可能先停在窗口动画或转场里，等它们做完才真正走到 pause
 signal pause_started(waits_for_click: bool)
 
+## 剧本请求玩家在若干选项里选一个。参数是选项表与本次请求的序号。
+##
+## items 每项 { caption, available, chosen, target }：
+##   caption    原文。**未翻译、未插值** —— 界面显示前自己过 tr() 与
+##              session.interpolate()，与台词走同一条路
+##   available  这一项的条件是否成立
+##   chosen     这一项在本机玩过没有。跨存档、跨周目（存档在 VNConfig 里）
+##   target     选中之后要跳去的位置。**界面不该读它**，玩家点中时把下标
+##              报给 choose() 就够了 —— 让界面碰到指令下标，等于把字节码
+##              布局泄露给内容层
+##
+## 发出后播放器停在 menu 上，期间 advance() 什么都不做，直到有人调 choose()。
+##
+## 一个选项都不可用时**不发这个信号**，播放器直接越过整条 menu 继续往后走。
+## 那是合法剧情路径（这一段本来就不该给玩家选），不是错误，所以不报警告
+signal menu_requested(items: Array, serial: int)
+
 ## 请求显示层预加载即将出现的内容。参数是一批 { "tag": String, "attrs": String }。
 ##
 ## 只是"接下来大概会用到"的建议 —— 显示层可以忽略、可以去重、可以延后。
@@ -137,6 +154,9 @@ const ATL_SCRIPT := preload("res://vn/ui/atl.gd")
 ## 理由与 ATL_SCRIPT 一样，而且它不该为了几个纯函数去占一个全局类名
 const SNAPSHOT := preload("res://vn/snapshot.gd")
 
+## 条件表达式求值。纯静态函数库，理由同上
+const EXPR := preload("res://vn/expr.gd")
+
 ## start() 的进入方式
 enum StartMode {
 	NEW_GAME,   ## 新游戏：每局状态（角色属性等）重置回注册时的初始定义
@@ -153,6 +173,10 @@ var session: VNSession = null
 var audio: VNAudio = null
 ## 玩家偏好。**读**它 —— 创建与落盘归 VNFrame
 var config: VNConfig = null
+## 成就。**只往它里面写**解锁与进度 —— 创建、落盘、Steam 都在它自己身上
+var achievements: VNAchievements = null
+## 持久化变量。跨周目数据，不进存档 —— 创建与落盘在 VNFrame
+var persistent: VNPersistent = null
 
 ## setup() 跑过没有。没跑就进剧情执行时给一条能查的报错，
 ## 而不是让空引用崩在某个深处
@@ -276,6 +300,16 @@ var _pending_call := false
 ## 跟着位置快照一起清空或覆盖
 var _inline_jumps: Array[Dictionary] = []
 
+## 停在 menu 上时，这次菜单的全部选项（每项的 available / chosen 已经算好）。
+## 空数组表示当前没有菜单在等 —— choose() 靠它判断调用是否合法
+var _menu_items: Array = []
+## 这条 menu 指令的 sid。它是"已选记录"的键的一半，另一半是选项文本。
+## 用 sid 而不是行号或物理位置：sid 跨次编译沿用，剧本改了别处之后
+## 这条记录依然认得出是同一个选项
+var _menu_sid := 0
+## 菜单请求序号。与转场、窗口那两套同理，让界面能识别出迟到的旧请求
+var _menu_serial := 0
+
 ###########################################################
 #  装配
 ###########################################################
@@ -287,10 +321,14 @@ var _inline_jumps: Array[Dictionary] = []
 ##
 ## 语音自然播完的信号在这里接 —— 只有本类关心它（要清属主），
 ## 所以不放在 VNAudio 里直接回调谁
-func setup(p_session: VNSession, p_audio: VNAudio, p_config: VNConfig) -> void:
+func setup(p_session: VNSession, p_audio: VNAudio, p_config: VNConfig,
+		p_achievements: VNAchievements = null,
+		p_persistent: VNPersistent = null) -> void:
 	session = p_session
 	audio = p_audio
 	config = p_config
+	achievements = p_achievements
+	persistent = p_persistent
 
 	if audio != null:
 		audio.voice_finished.connect(_on_voice_finished)
@@ -326,6 +364,12 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 	# 已经清空的角色属性是收不回来的
 	if not story.load_story(package_path):
 		return false
+
+	# persistent 的初值补在剧本加载之后：它来自 default 表，而表刚读进来。
+	# 每次 start 都补（不限 NEW_GAME）—— 它记的是玩家跨周目的进度，
+	# 与开不开新局无关
+	if persistent != null:
+		persistent.apply_defaults(story.defaults)
 
 	var begin := 0
 	if not label_name.is_empty():
@@ -371,6 +415,8 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 	# 上一局若停在 pause 里，新的一局不该继承这个等待
 	_clear_pause()
 	_clear_pending_wait()
+	# 菜单同理：上一局没选完的那张菜单不能把新的一局挡在门口
+	_clear_menu()
 	# 补齐剧本里声明过、但变量表里还没有的量。NEW_GAME 上面那条 reset_vars
 	# 已经把整张表灌好了，这里对它是空操作；CONTINUE（章节切换）才是它
 	# 真正起作用的地方 —— 新章节新增的 default 不该等到第一次 += 才从零起算。
@@ -401,6 +447,10 @@ func advance() -> void:
 		return
 	# 窗口显隐同理：动画没做完之前剧情不该往下走
 	if _waiting_window:
+		return
+	# 停在 menu 上：等玩家选。自动播放、快进与玩家点击都从 advance() 进来，
+	# 只在这一处挡住就够了 —— 界面那边不需要知道"现在不能推"
+	if not _menu_items.is_empty():
 		return
 	if not _check_ready():
 		return
@@ -535,6 +585,21 @@ func advance() -> void:
 			_apply_save(op)
 			continue
 
+		# 成就。和 save 同一类：不产生台词、不停顿、不碰舞台。
+		#
+		# **不挡重放**，这一点和 set / save 相反 —— 读档恢复会把剧本从头
+		# 走一遍，那一遍里路过的成就本来就该解锁（玩家确实走到过那里）。
+		# 重复执行由 VNAchievements 的幂等挡住：已经记下的再调一次什么都
+		# 不做，也不会重复上报 Steam
+		if kind == "achievement_unlock":
+			_apply_achievement_unlock(op)
+			continue
+
+		# 进度。第三格是编译期内联进来的上限；到点了 progress() 会顺带解锁
+		if kind == "achievement_progress":
+			_apply_achievement_progress(op)
+			continue
+
 		if kind == "scene":
 			# 先让对话框淡出，再动舞台 —— 与 Ren'Py 的顺序一致。
 			# 快进时窗口瞬时切换，不暂停；恢复位置时也跳过窗口动画
@@ -599,6 +664,28 @@ func advance() -> void:
 				continue
 			_start_pause(op)
 			return
+
+		# 条件跳转。条件为假就跳到 else 那一支的入口，为真则继续往下 ——
+		# 真的时候什么都不做，所以这里只是一次正常推进
+		if kind == "jump_if_false":
+			if not _condition_holds(op):
+				var cond_to := _target_index(op, 1)
+				if cond_to < 0:
+					push_error("jump_if_false 的目标不存在：%s" % _target_name(op, 1))
+					_end("")
+					return
+				_cursor = cond_to - 1
+			continue
+
+		# 玩家选择。停下来等 choose()。
+		#
+		# _open_menu 返回 false 表示一个选项都不可用 —— 它已经把 _cursor
+		# 挪到了 menu 之后，这里 continue 继续往后走。那不是错误处理，
+		# 而是一条合法剧情路径：这一段本来就不该给玩家选
+		if kind == "menu":
+			if _open_menu(op):
+				return
+			continue
 
 		if kind == "jump":
 			var jump_to := _target_index(op)
@@ -789,6 +876,9 @@ func restore_position(snapshot: Dictionary, poses: Dictionary = {},
 	# pause 同理：上一处若停在等待里，新位置不该继承它
 	_clear_pause()
 	_clear_pending_wait()
+	# 菜单同理。读档落在一条 menu 上时，它会由 advance() 重新发一次请求 ——
+	# 保留旧的那份只会让界面对着上一个位置的选项表
+	_clear_menu()
 
 	# 读档停在台词上，窗口必须是显示状态。界面可能还藏着对话框，
 	# 发一个零时长的显示请求让它立刻露出来（不等待：这是一次定位）
@@ -1016,6 +1106,10 @@ func _apply_missing_defaults() -> void:
 		var path := String(d.get("path", ""))
 		if path.is_empty() or session.has_var(path):
 			continue
+		# persistent 前缀的声明不归这一局的变量表管。读档时补它没有意义 ——
+		# 它本来就不进存档，补了也只是给 session 塞一份没人读的副本
+		if VNPersistent.is_persistent_path(path):
+			continue
 		session.set_var(path,
 			VNSession.decode_value(String(d.get("kind", "s")),
 				String(d.get("value", ""))),
@@ -1176,6 +1270,8 @@ func end_session() -> void:
 	_skipping = false
 	# 这一局已经结束，pause 的倒计时没有继续的理由
 	_clear_pause()
+	# 菜单也一样：这一局都不在了，没有人会替它做选择
+	_clear_menu()
 
 ###########################################################
 #  舞台重建
@@ -1358,20 +1454,196 @@ func _stack_matches(returns: Array[int]) -> bool:
 #  控制流
 ###########################################################
 
-## 取 jump / call 的目标指令下标。目标 label 不存在时返回 -1。
+## 取一条跳转类指令的目标指令下标。目标 label 不存在时返回 -1。
+##
+## slot 是目标名在 args 里的位置：jump / call 在第 0 格，jump_if_false 与
+## menu 在第 1 格（第 0 格是条件 / 选项表）。
 ##
 ## 返回值必须挡住 -1：GDScript 里 story.ops[-1] 是"最后一条"而不是越界，
 ## 不挡住的话，一个坏掉的跳转目标会让剧情静默跳到文件末尾
-func _target_index(op: Dictionary) -> int:
+func _target_index(op: Dictionary, slot: int = 0) -> int:
+	var args: Array = op["args"]
+	if args.size() <= slot:
+		return -1
+	return story.label_start(String(args[slot]))
+
+## 取跳转类指令的目标名，只用于报错
+func _target_name(op: Dictionary, slot: int = 0) -> String:
+	var args: Array = op["args"]
+	return String(args[slot]) if args.size() > slot else "<空>"
+
+## 求值一条 jump_if_false 的条件。表达式解析失败时返回 false（当作不成立），
+## 让剧情走 else 分支而不是卡死在原地 —— 参数坏掉是编译器的问题，
+## 玩家不该为此停在半路
+func _condition_holds(op: Dictionary) -> bool:
 	var args: Array = op["args"]
 	if args.is_empty():
-		return -1
-	return story.label_start(String(args[0]))
+		push_error("jump_if_false 缺少条件参数")
+		return false
 
-## 取 jump / call 的目标名，只用于报错
-func _target_name(op: Dictionary) -> String:
+	var node = JSON.parse_string(String(args[0]))
+	if node == null:
+		push_error("条件表达式解析失败：%s" % String(args[0]))
+		return false
+
+	return EXPR.test(node, session, achievements, persistent)
+
+## 打开一条 menu，把选项算好交给界面。
+##
+## 返回 true 表示已经停在菜单上等玩家选；返回 false 表示**一个选项都不可用**，
+## 此时 _cursor 已经被挪到 menu 之后，调用方接着往下走就行。
+##
+## 跳过时不报错也不警告：所有选项都关着是作者写出的一条合法路径
+## （"这一段现在没有能做的事"），不是配置错误
+func _open_menu(op: Dictionary) -> bool:
 	var args: Array = op["args"]
-	return String(args[0]) if args.size() > 0 else "<空>"
+	if args.size() < 2:
+		push_error("menu 指令的参数不完整：%s" % str(args))
+		return false
+
+	var raw = JSON.parse_string(String(args[0]))
+	if not (raw is Array):
+		push_error("menu 的选项表解析失败：%s" % String(args[0]))
+		return false
+
+	var sid := int(op.get("sid", 0))
+	var items: Array = []
+	var any_available := false
+
+	for entry in raw:
+		if not (entry is Dictionary):
+			continue
+
+		var table: Dictionary = entry
+		var caption := String(table.get("caption", ""))
+		# cond 为 null 表示这一项没有条件，恒可选
+		var cond = table.get("cond")
+		var available: bool = cond == null or EXPR.test(cond, session,
+			achievements, persistent)
+
+		if available:
+			any_available = true
+
+		items.append({
+			"caption": caption,
+			"available": available,
+			"chosen": config != null and config.is_choice_chosen(sid, caption),
+			# 呈现方式修饰词（gray / off），空串表示跟随作品级默认。
+			# 播放器只负责把它原样带过去 —— "画成什么样"是界面的事
+			"mode": String(table.get("mode", "")),
+			"target": String(table.get("target", "")),
+		})
+
+	if not any_available:
+		var end_to := _target_index(op, 1)
+		if end_to < 0:
+			# 这就是真错误了：兜底目标不存在，剧情没有可去的地方
+			push_error("menu 的兜底目标不存在：%s" % _target_name(op, 1))
+			_end("")
+			return true
+		_cursor = end_to - 1
+		return false
+
+	# ── 提示语与对话框 ──
+	#
+	# 提示语和选项**同一步**出现：说一句，同时给出选项。这是 Ren'Py 的
+	# 做法（renpy/ast.py 的 Menu.execute 把 caption 用 interact=False 的
+	# say 显示，不等待），也正因为不等待，它不能拆成一条独立的 say 指令 ——
+	# 那样玩家得先点一下才看得见选项
+	var speaker := String(args[2]) if args.size() > 2 else ""
+	var menu_caption := String(args[3]) if args.size() > 3 else ""
+	if menu_caption.is_empty():
+		_hide_menu_window()
+	else:
+		_show_menu_window()
+		_emit_line("say" if not speaker.is_empty() else "say_literal",
+			speaker, menu_caption, "")
+
+	_menu_items = items
+	_menu_sid = sid
+	_menu_serial += 1
+	menu_requested.emit(items, _menu_serial)
+	return true
+
+## 确保对话框显示着。menu 的提示语要有个地方显示出来。
+##
+## 用 _request_window_now() 而不是 _request_window()：后者会挂起等待动画，
+## 而那一下正好卡在"选项已经该出现"的位置上。菜单是一次交互，不是一段演出
+func _show_menu_window() -> void:
+	if _window_visible:
+		return
+	_window_visible = true
+	_request_window_now(true)
+
+## 没有提示语的 menu 把对话框藏起来。
+##
+## 上一句的文字已经读完了，菜单出现时还露在外面会让人以为"还能接着点"。
+## 只藏窗口、**不清内容** —— 再显示时那一句还在，切语言也能重新翻译。
+##
+## 对应 Ren'Py 的 config.choice_empty_window 做的那件事，只是方向相反：
+## 那边是"没窗口就补一个空的"，这里是"有窗口就收起来"
+func _hide_menu_window() -> void:
+	if not _window_visible:
+		return
+	_window_visible = false
+	_request_window_now(false)
+
+## 玩家在菜单里选了第 index 项。由界面在玩家点中某一项时调用。
+##
+## 选的语义就是一次跳转 —— 和剧本里写一条 jump 完全等价，所以这里只是
+## 把游标挪到那一项的入口，然后照常 advance()。不为它单开一条执行路径
+func choose(index: int) -> void:
+	if _menu_items.is_empty():
+		push_error("VN.choose()：当前没有等待选择的菜单")
+		return
+
+	if index < 0 or index >= _menu_items.size():
+		push_error("VN.choose()：下标越界 %d（本次菜单共 %d 项）"
+			% [index, _menu_items.size()])
+		return
+
+	var item: Dictionary = _menu_items[index]
+
+	# 不可用的项按设计不该被点到。挡在这里而不是相信界面，是因为
+	# 界面可能画错了、或者玩家用键盘选到了一个置灰项
+	if not bool(item["available"]):
+		push_error("VN.choose()：第 %d 项的条件不成立，不能选" % index)
+		return
+
+	var target := story.label_start(String(item["target"]))
+	if target < 0:
+		push_error("VN.choose()：选项的落点不存在：%s" % String(item["target"]))
+		return
+
+	# 记已选。键是 (menu 的 sid, 选项文本)，落在 VNConfig 里 ——
+	# 跨存档、跨周目，对应 Ren'Py 的 persistent._chosen
+	if config != null:
+		config.mark_choice_chosen(_menu_sid, String(item["caption"]))
+
+	# 再记一条历史：玩家在历史界面里要能看到自己选了什么。
+	#
+	# 位置记的是 menu 本身 —— 此刻 _cursor 还指着它，回跳到这一条就是
+	# 回到那个选择点。它和提示语共用 menu 的 sid，靠 text 不同来区分
+	# （见 VNHistory.add 的去重判据）
+	#
+	# 变更日志**留空**：选项块里那些 set 的旧值归到后面第一句台词上，
+	# 这里再 take_journal() 会把它们截走，回跳就撤销不掉了
+	session.add_history(_menu_sid, "", String(item["caption"]), "",
+		capture_position(), {
+			"pose": session.stage_poses(),
+			"stage": session.stage(),
+			"bgm": audio.current_bgm() if audio != null else "",
+		})
+
+	_clear_menu()
+	_cursor = target - 1
+	advance()
+
+## 清空"正在等选择"的状态。换位置（start / 读档 / 结束）时必须调 ——
+## 否则上一次没选完的菜单会把新位置的 advance() 一直挡在门口
+func _clear_menu() -> void:
+	_menu_items = []
+	_menu_sid = 0
 
 ## 从内联跳转记录里找出这条台词点过一次的那一条。没有则返回空字典。
 ##
@@ -1487,6 +1759,15 @@ func _apply_set(op: Dictionary) -> void:
 		session.set_character_property(segments[1], segments[2], String(value))
 		return
 
+	# 持久化变量走自己的表。它不进 session —— 那会让它跟着存档走，
+	# 也就失去了"跨周目"的意义
+	if VNPersistent.is_persistent_path(path):
+		if persistent == null:
+			push_error("set：本局没有接 VNPersistent，\"%s\" 被丢弃" % path)
+			return
+		persistent.set_var(path, value, how)
+		return
+
 	session.set_var(path, value, how)
 
 ## 玩法侧写变量。路径必须是剧本里 default 声明过的，否则拒绝。
@@ -1497,6 +1778,15 @@ func set_var(path: String, value: Variant) -> bool:
 	if not is_var_declared(path):
 		push_error("VN.set_var：\"%s\" 没有 default 声明，不能凭空创建变量" % path)
 		return false
+
+	# 与剧本里的 set 同一套分流：persistent 走自己的表，不进这一局
+	if VNPersistent.is_persistent_path(path):
+		if persistent == null:
+			push_error("VN.set_var：本局没有接 VNPersistent，\"%s\" 被丢弃" % path)
+			return false
+		persistent.set_var(path, value, "=")
+		return true
+
 	session.set_var(path, value, "=")
 	return true
 
@@ -1641,6 +1931,30 @@ func _apply_save(op: Dictionary) -> void:
 		return
 	save_requested.emit(String(args[0]), capture_state())
 
+## 执行一条 achievement_unlock。args 是 [成就 id]。
+##
+## 没有 achievements 说明 VNFrame 没接 —— 那只可能是自检脚本，安静跳过
+func _apply_achievement_unlock(op: Dictionary) -> void:
+	if achievements == null:
+		return
+	var args: Array = op["args"]
+	if args.is_empty():
+		return
+	achievements.unlock(String(args[0]))
+
+## 执行一条 achievement_progress。args 是 [成就 id, 当前值, 上限]。
+##
+## 上限是编译器内联的第三格。手动改过 .vnbc 缺了它时按 0 处理 ——
+## 那就只是记个进度，永远不会自动解锁，但不会崩
+func _apply_achievement_progress(op: Dictionary) -> void:
+	if achievements == null:
+		return
+	var args: Array = op["args"]
+	if args.size() < 2:
+		return
+	var max_value := int(String(args[2])) if args.size() > 2 else 0
+	achievements.progress(String(args[0]), int(String(args[1])), max_value)
+
 ## 取一个浮点参数。越界或空串时返回 fallback
 func _arg_float(args: Array, index: int, fallback: float) -> float:
 	if index >= args.size():
@@ -1765,6 +2079,10 @@ func set_skipping(on: bool) -> void:
 func is_waiting_pause() -> bool:
 	return _waiting_pause
 
+## 是否停在菜单上等玩家选。界面读档后重建时用它判断该不该把选项画出来
+func is_waiting_menu() -> bool:
+	return not _menu_items.is_empty()
+
 ## 当前 pause 是否在等点击（而不是等秒数）。
 ## 自动播放靠它区分"要不要替玩家点这一下"
 func pause_waits_for_click() -> bool:
@@ -1885,19 +2203,25 @@ func _process(_delta: float) -> void:
 ## 所以 .vnbc 里存的永远是原文
 func _show_current() -> void:
 	var op: Dictionary = story.ops[_cursor]
-	var kind: String = op["op"]
 	var args: Array = op["args"]
 
-	var who_raw := ""
-	var text := ""
-	var voice := ""
-	if args.size() > 0:
-		who_raw = String(args[0])
-	if args.size() > 1:
-		text = String(args[1])
-	if args.size() > 2:
-		voice = String(args[2])
+	var who_raw := String(args[0]) if args.size() > 0 else ""
+	var text := String(args[1]) if args.size() > 1 else ""
+	var voice := String(args[2]) if args.size() > 2 else ""
 
+	_emit_line(String(op["op"]), who_raw, text, voice)
+
+## 显示一句文字：更新语音、记历史、发 line_shown、报章节。
+##
+## 两条路共用它：_show_current()（指令流里的 say / say_literal），
+## 以及 _open_menu() 里的 menu 提示语。两者在"玩家读到一句文字"这件事上
+## 完全一样，差别只在文字从哪来 —— 所以翻译、插值、语音归属、历史这些
+## 只该有一份实现。
+##
+## 位置用 capture_position()：advance() 是先加一后取，走到这里时
+## _cursor 正指着产生这句文字的那条指令。menu 的提示语也适用 —— 它挂在
+## menu 指令上，所以快照指着 menu，回跳会回到那个选择点
+func _emit_line(kind: String, who_raw: String, text: String, voice: String) -> void:
 	var who := who_raw if kind == "say_literal" else _resolve_role_name(who_raw)
 
 	# 字面说话人（旁白、直接写名字的那种）不对应任何角色，语音也就没有
@@ -1913,11 +2237,7 @@ func _show_current() -> void:
 	# 之后旧记录永远停在上一门语言 —— 而且 tr() 是单向的，存了译文就再也
 	# 拿不回 msgid。现在改为存原文、显示时翻译（见 history.gd 与
 	# save_load.gd 的附言渲染），旧存档里的译文会被 tr() 原样返回，
-	# 两种格式可以共存。
-	#
-	# 位置用 capture_position()：advance() 是先加一后取，走到这里时
-	# _cursor 正指着这条 say 指令，快照拿到的就是它。快进时同样会走到
-	# 这里，所以快进过的句子照记，和 Ren'Py 一致
+	# 两种格式可以共存
 	var shown_who := tr(who)
 	# 插值放在 tr 之后：译文里同样可以写 [变量]。历史存的是原文，
 	# 那边显示时再各自插值一次
@@ -2069,6 +2389,7 @@ func _end(ending: String) -> void:
 	if config != null:
 		config.save_seen()
 		config.save_seen_images()
+		config.save_chosen()
 	_playing = false
 	_call_stack.clear()
 	stop_voice()
@@ -2081,6 +2402,8 @@ func _end(ending: String) -> void:
 	# pause 的倒计时也停掉；结束之后没有人会来消费它
 	_clear_pause()
 	_clear_pending_wait()
+	# 菜单：会话结束了，停在菜单上的选择请求一并作废
+	_clear_menu()
 	story_ended.emit(ending)
 
 ## 从当前游标往回找最近的 label，同步 _label_name 与 _label_begin。

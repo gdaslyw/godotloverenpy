@@ -40,6 +40,18 @@ const SEEN_FILE_NAME := "seen.dat"
 ## 图像 id（CG 鉴赏用），两者的增长节奏、用途、将来的清空方式都不一样
 const IMAGES_FILE_NAME := "images.dat"
 
+## 已选菜单项的记录文件名。
+##
+## 对应 Ren'Py 的 persistent._chosen（persistent.py:47）：键是
+## (菜单的持久标识, 选项文本)，用来把选过的选项标出来。
+## 与上面两份的区别在**语义**：那两份只是"看过"，这一份是"选过"，
+## 影响的是菜单上要不要给这一项换一种样式
+const CHOSEN_FILE_NAME := "chosen.dat"
+
+## 已选记录里 sid 与选项文本的分隔符。
+## 用 Unit Separator 而不是 "|"：选项文本是作者写的，里面完全可能有竖线
+const CHOSEN_SEP := "\u001F"
+
 ## 写盘节流间隔（毫秒）。
 ##
 ## 快进时每秒会标记几十条已读，逐条写盘就是每秒几十次文件写入。
@@ -151,6 +163,36 @@ const DEFAULT_QM_AUTO_HIDE := true
 var qm_auto_hide := DEFAULT_QM_AUTO_HIDE
 
 ###########################################################
+#  选项（menu）
+#
+#  这两项和 VNSettings 那两个不是一回事，别混：
+#    VNSettings.menu_show_locked  作品级默认，决定"没写修饰词的选项"怎么呈现，
+#                                 剧本里的 gray / off 会逐项覆盖它。作者的事
+#    这里的两项                   玩家的偏好，只影响观感与节奏，改不了条件
+###########################################################
+
+## 选过的选项要不要换一种样式。对应 Ren'Py 的 config.choice_screen_chosen
+## （那边默认 True，这里跟它一致）
+##
+## 关掉之后所有选项长得一样 —— 适合"不想让玩家看出分支存在过"的作品。
+## 己选记录本身照常记，只是不画出来
+const DEFAULT_MENU_MARK_CHOSEN := true
+
+var menu_mark_chosen := DEFAULT_MENU_MARK_CHOSEN
+
+## 快进时遇到选项要不要停下来。
+##
+## 对应 Ren'Py 的 preferences.skip_after_choices。那边管的是"做出选择之后
+## 还继不继续快进"，但玩家的实际体感是同一件事：一路快进冲到一个选项，
+## 停下来做选择。开着这一项时，菜单一出现就解除快进；
+## 关着时快进状态留着（推不动，但选完之后会接着走）
+##
+## 默认 true：选项是必须停下来的交互，快进冲过去毫无意义
+const DEFAULT_SKIP_AFTER_CHOICES := true
+
+var skip_after_choices := DEFAULT_SKIP_AFTER_CHOICES
+
+###########################################################
 #  窗口
 ###########################################################
 
@@ -206,6 +248,19 @@ var _seen_images_dirty := false
 ## 图像记录上次写盘的时刻（毫秒）
 var _seen_images_saved_ms := 0
 
+## 选过的菜单项："<sid>\u001F<选项文本>" → true。
+##
+## 跨存档、跨周目：它不属于任何一局，是这台机器上的玩家的历史。
+## 键里带 sid 而不只是文本，是因为不同菜单里可以有同名选项
+## （"好"、"算了"这种短词很容易重复），只按文本记会把它们混成一条
+var _chosen: Dictionary = {}
+
+## 已选记录有没有还没落盘的改动
+var _chosen_dirty := false
+
+## 已选记录上次写盘的时刻（毫秒）
+var _chosen_saved_ms := 0
+
 ###########################################################
 #  初值
 ###########################################################
@@ -259,6 +314,8 @@ func reset_playback() -> void:
 	window_alpha = clamp_value("window_alpha", DEFAULT_WINDOW_ALPHA)
 	mouse_hide_time = DEFAULT_MOUSE_HIDE_TIME
 	qm_auto_hide = DEFAULT_QM_AUTO_HIDE
+	menu_mark_chosen = DEFAULT_MENU_MARK_CHOSEN
+	skip_after_choices = DEFAULT_SKIP_AFTER_CHOICES
 	dialog_font = ""
 
 ## 把所有音量恢复成满，并立刻应用到总线。
@@ -425,6 +482,10 @@ static func seen_path() -> String:
 static func images_path() -> String:
 	return data_dir().path_join(IMAGES_FILE_NAME)
 
+## 已选菜单记录的完整路径
+static func chosen_path() -> String:
+	return data_dir().path_join(CHOSEN_FILE_NAME)
+
 ## 备用路径。主目录不可写时（例如游戏装在 Program Files）退回这里
 static func fallback_path() -> String:
 	return "user://" + FILE_NAME
@@ -506,6 +567,10 @@ func load_config() -> void:
 		float(cfg.get_value(SECTION, "mouse_hide_time", DEFAULT_MOUSE_HIDE_TIME)),
 		0.0)
 	qm_auto_hide = bool(cfg.get_value(SECTION, "qm_auto_hide", DEFAULT_QM_AUTO_HIDE))
+	menu_mark_chosen = bool(cfg.get_value(SECTION, "menu_mark_chosen",
+		DEFAULT_MENU_MARK_CHOSEN))
+	skip_after_choices = bool(cfg.get_value(SECTION, "skip_after_choices",
+		DEFAULT_SKIP_AFTER_CHOICES))
 	dialog_font = String(cfg.get_value(SECTION, "dialog_font", ""))
 	# 语言：读进来先归一。写错的名字（旧版本留下的）在这里就被纠正成
 	# 四种语言之一，后面所有读它的地方都不必再自己判一次
@@ -538,6 +603,8 @@ func save_config() -> bool:
 	cfg.set_value(SECTION, "window_alpha", window_alpha)
 	cfg.set_value(SECTION, "mouse_hide_time", mouse_hide_time)
 	cfg.set_value(SECTION, "qm_auto_hide", qm_auto_hide)
+	cfg.set_value(SECTION, "menu_mark_chosen", menu_mark_chosen)
+	cfg.set_value(SECTION, "skip_after_choices", skip_after_choices)
 	cfg.set_value(SECTION, "dialog_font", dialog_font)
 	cfg.set_value(SECTION, "language", language)
 	cfg.set_value(SECTION, "fullscreen", fullscreen)
@@ -724,6 +791,111 @@ func _flush_seen_images() -> void:
 	if Time.get_ticks_msec() - _seen_images_saved_ms < SEEN_SAVE_INTERVAL_MS:
 		return
 	save_seen_images()
+
+###########################################################
+#  选过的菜单项
+#
+#  对应 Ren'Py 的 persistent._chosen。用途只有一个：让菜单标出
+#  "这一项你选过"。它不是剧情状态 —— 换存档、重开一局都还在，
+#  因为它记的是**玩家**做过什么，不是**这一局**走到哪
+###########################################################
+
+## 这个菜单里的这个选项选过没有。
+##
+## menu_sid 是 menu 指令的 sid；同一个 sid 就代表同一条 menu。
+## 剧本改动之后 sid 由编译器按内容配对继承，改别处不会影响它
+func is_choice_chosen(menu_sid: int, caption: String) -> bool:
+	return _chosen.has(_chosen_key(menu_sid, caption))
+
+## 记下一个选过的菜单项。写盘走节流，与已读记录同一个间隔
+func mark_choice_chosen(menu_sid: int, caption: String) -> void:
+	if menu_sid == 0 or caption.is_empty():
+		# sid 为 0 是"还没有分配 sid 的指令"，拿它当键会把不同的菜单混成一条。
+		# 正常编译产物里不会出现，这里只是不记而已，不影响玩家已经做完的选择
+		return
+
+	var key := _chosen_key(menu_sid, caption)
+	if _chosen.has(key):
+		return
+
+	_chosen[key] = true
+	_chosen_dirty = true
+	_flush_chosen()
+
+## 读已选记录。文件不存在就当一条都没有 —— 首次运行就是这样，不是错误
+func load_chosen() -> void:
+	_chosen.clear()
+	_chosen_dirty = false
+
+	var path := chosen_path()
+	if not FileAccess.file_exists(path):
+		path = "user://" + CHOSEN_FILE_NAME
+		if not FileAccess.file_exists(path):
+			return
+
+	var file := FileAccess.open(path, FileAccess.READ)
+	if file == null:
+		push_warning("已选菜单记录读取失败：%s" % path)
+		return
+
+	var data: Variant = file.get_var()
+	file.close()
+
+	# 存的是键的字符串数组。值恒为 true，没有信息量
+	if data is PackedStringArray:
+		for key in data:
+			var text := String(key)
+			# 没有分隔符的条目只可能来自手改过的文件，跳过它而不是
+			# 让它在 _chosen 里占一个永远查不到的位置
+			if text.contains(CHOSEN_SEP):
+				_chosen[text] = true
+
+## 把已选记录写盘。
+##
+## 剧情结束、回主菜单这类收尾节点该直接调它，理由同 save_seen()
+func save_chosen() -> bool:
+	_chosen_saved_ms = Time.get_ticks_msec()
+	if not _chosen_dirty:
+		return true
+
+	var keys := PackedStringArray()
+	keys.resize(_chosen.size())
+	var i := 0
+	for key in _chosen:
+		keys[i] = String(key)
+		i += 1
+
+	if _write_chosen(chosen_path(), keys) != OK:
+		if _write_chosen("user://" + CHOSEN_FILE_NAME, keys) != OK:
+			push_error("已选菜单记录写入失败：%s" % chosen_path())
+			return false
+		push_warning("玩家数据目录不可写，已选菜单记录已改存 %s"
+			% ("user://" + CHOSEN_FILE_NAME))
+
+	_chosen_dirty = false
+	return true
+
+## 写一份已选记录到指定路径，返回 Godot 的错误码
+func _write_chosen(path: String, keys: PackedStringArray) -> int:
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return FileAccess.get_open_error()
+	file.store_var(keys)
+	file.close()
+	return OK
+
+## 按间隔把已选记录落盘
+func _flush_chosen() -> void:
+	if Time.get_ticks_msec() - _chosen_saved_ms < SEEN_SAVE_INTERVAL_MS:
+		return
+	save_chosen()
+
+## 拼一个已选记录的键。
+##
+## 单独提出来，是因为"键长什么样"在写与读两侧各出现一次，
+## 而它们分居不同函数 —— 拼法一旦不一致，症状是"选了没记上"，且不报错
+func _chosen_key(menu_sid: int, caption: String) -> String:
+	return str(menu_sid) + CHOSEN_SEP + caption
 
 ###########################################################
 #  音量应用

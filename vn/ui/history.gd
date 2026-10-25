@@ -73,16 +73,22 @@ var _entries: Array[Dictionary] = []
 ## 而"取的那一刻"必须正好是这句台词落地的这一帧。晚一帧就抓到下一句的
 ## 画面了，早一帧舞台还没跟上这条 show。
 ##
-## 去重的判据是 sid 与本列表**最后一条**相同。为什么需要它：
+## 去重的判据是 sid 与 text 都跟**最后一条**相同。为什么需要它：
 ## restore_position() 会重新显示当前句，而回跳正是走它 —— 不去重的话，
 ## 每次回跳都会在末尾多堆一条重复的。
+##
+## 为什么还要比 text：menu 的提示语与玩家选中的那一项共用**菜单指令**的
+## sid（它们都不是独立指令），只比 sid 的话第二条会被当成重复丢掉，
+## 历史里就只剩提示语、看不到选了什么
 ##
 ## 只比最后一条、不做全表去重：loop 回到之前的 label 是合法写法，
 ## 那时同一句确实该再记一次，全表去重会把这类正常情况一起吃掉
 func add(sid: int, who: String, text: String, voice: String,
 		position: Dictionary, moment: Dictionary) -> bool:
-	if not _entries.is_empty() and int(_entries[-1].get("sid", 0)) == sid:
-		return false
+	if not _entries.is_empty():
+		var tail: Dictionary = _entries[-1]
+		if int(tail.get("sid", 0)) == sid and String(tail.get("text", "")) == text:
+			return false
 
 	# 逐项深拷。moment 里的两张 delta 表是 VNSession 刚交出来的活引用，
 	# 不拷的话之后那次 take_journal() 之前的写入会改到已经归档的条目

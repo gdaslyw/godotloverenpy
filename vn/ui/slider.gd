@@ -18,7 +18,8 @@ extends Range
 #  HSlider 的轨道是 StyleBox、滑块是 theme icon。想让它长得跟原项目那张
 #  874x50 的图一样，得把图切九宫格、再算 grabber_offset 抵掉滑块自身的
 #  宽度 —— 算出来的结果还不如直接按像素画准。而且 HSlider 自带键盘焦点
-#  框、方向键增量、滚动轮增量，这个界面一样都用不上，反倒要逐条关掉。
+#  框和 theme 那套，这个界面一样都用不上；本类的焦点视觉自己画，
+#  方向键增量也自己接（见 _gui_input）。
 #
 #  ── 写盘时机 ──
 #
@@ -60,12 +61,27 @@ signal vn_released
 ## 两边微调不够用时用它整体平移
 @export var thumb_offset := 0.0
 
+## 是否参与键盘焦点导航。
+##
+## 默认关：项目里其他滑块（音乐进度条之类）仍只认鼠标。设置页把它打开，
+## 焦点停在滑块上时左右键调值、上下键交给引擎移到相邻控件。
+@export var keyboard_focus := false:
+	set(value):
+		keyboard_focus = value
+		_sync_focus_mode()
+
 ###########################################################
 #  内部
 ###########################################################
 
 ## 现在是不是正按着左键拖
 var _dragging := false
+
+## 键盘方向键是不是正在连续调值（按下后还没松开）。
+##
+## 长按方向键会持续产生 echo 事件，每一下都写盘会把设置页卡住。
+## 所以调值时只标记，等松开（或焦点被移走）再发一次 vn_released。
+var _key_adjusting := false
 
 ## 路径 → 纹理。三张图在整个生命周期里不会变，查一次就够
 var _textures: Dictionary = {}
@@ -79,6 +95,12 @@ func _init() -> void:
 	changed.connect(queue_redraw)
 
 func _ready() -> void:
+	# 输入模式在 gui_get_hovered_control() 查不到时会遍历这个组，
+	# 按矩形兜底找"鼠标下的滑条"
+	add_to_group(&"vn_sliders")
+	# VNFocus 切换当前焦点时通过这个组通知重画
+	add_to_group(&"vn_focus_visuals")
+
 	# STOP 而不是 PASS：滑块要把落在自己身上的点击吃掉，
 	# 否则会漏到底下的台词界面去推进剧情
 	mouse_filter = Control.MOUSE_FILTER_STOP
@@ -91,10 +113,91 @@ func _ready() -> void:
 	# "鼠标移到滑条上，自定义光标凭空消失，变回一只系统小手"。
 	# 想让滑块也有专属光标，正路是给项目换图，不是在这里改 enum
 
-	# 明确关掉键盘焦点。Range 本身不设这一项，但一旦有人给它设成 ALL，
-	# 用 Tab 切焦点时会在滑块周围画出一圈引擎默认的虚线框 —— 那不属于
-	# 这套界面，而且它只会在键盘操作时出现，很难联想到是这里的问题
-	focus_mode = Control.FOCUS_NONE
+	# 焦点模式由 keyboard_focus 决定，默认仍是 FOCUS_NONE。
+	#
+	# 打开时也不会有引擎默认的虚线框：本类自绘 _draw()，不画 theme 的
+	# focus 样式；焦点视觉是滑块下面那圈柔光（见 _draw）。
+	focus_entered.connect(_on_focus_entered)
+	focus_exited.connect(_on_focus_exited)
+	_sync_focus_mode()
+
+	# 鼠标移到滑条上时先拿一个隐藏焦点。
+	#
+	# 目的是让"鼠标停在滑条上按方向键"有一个确定的落脚点：VNInputMode
+	# 在方向键按下时会先看当前焦点，再看鼠标位置；这两条都失效时才会
+	# 退回界面默认首项（就是焦点跑侧边栏/窗口大小那一组的原因）。
+	#
+	# 只在当前完全没有焦点时拿：键盘导航中鼠标恰好扫过滑条，不该把
+	# 焦点从按钮上抢走。
+	mouse_entered.connect(_on_mouse_entered)
+	mouse_exited.connect(_on_mouse_exited)
+
+	# 输入模式切换时重画：键盘模式下焦点光晕才是唯一的高亮来源，
+	# 鼠标模式下焦点已经被清掉，不该继续亮
+	if VN.input_mode != null:
+		VN.input_mode.mode_changed.connect(_on_input_mode_changed)
+
+## 按 keyboard_focus 同步原生焦点模式。
+##
+## 滑块没有 disabled 这一档，可用性由调用方自己决定；这里只区分
+## "参不参与键盘导航"。
+func _sync_focus_mode() -> void:
+	focus_mode = Control.FOCUS_ALL if keyboard_focus else Control.FOCUS_NONE
+
+## 输入模式切换。滑块没有 hover 视觉，只关心焦点光晕还在不在
+func _on_input_mode_changed(_mode: int) -> void:
+	queue_redraw()
+
+## 按一个步长调值。键盘左右键走这里。
+##
+## **不在这里发 vn_released**：长按方向键的 echo 会一秒触发几十次，
+## 每一下都让设置页写盘会把界面卡住。这里只标记"正在键盘调值"，
+## 松开时（或焦点被移走时，见 _on_focus_exited）统一补发一次。
+func _step_value(direction: float) -> void:
+	var delta := step if step > 0.0 \
+		else maxf((max_value - min_value) / 100.0, 0.0001)
+	set_value(clampf(value + direction * delta, min_value, max_value))
+	_key_adjusting = true
+
+## 焦点进入。有作用域时反向同步逻辑焦点（Tab/grab_focus 路径）
+func _on_focus_entered() -> void:
+	if VNFocus.has_scope() and has_focus(true):
+		VNFocus.adopt(self)
+	queue_redraw()
+
+## VNFocus 切换当前焦点后由组通知重画
+func _refresh_focus_visuals() -> void:
+	queue_redraw()
+
+## 焦点离开。键盘调值还没等到松开时，补发一次 vn_released，
+## 避免设置页漏写盘；同时重画，把焦点光晕收掉。
+func _on_focus_exited() -> void:
+	if _key_adjusting:
+		_key_adjusting = false
+		vn_released.emit()
+	queue_redraw()
+
+## 鼠标移到滑条上：当前没有任何焦点时，先拿一个隐藏焦点。
+##
+## 只拿隐藏焦点（hide_focus=true），不显示 —— 鼠标模式下按钮/滑条都不看
+## 焦点外观，滑条不该因为鼠标扫过就亮起键盘光晕。等玩家真按方向键，
+## VNInputMode 会把它显示出来，并把这次按键放行给 _gui_input() 调值。
+##
+## 只在焦点为空时拿：键盘导航中鼠标恰好扫过滑条，不该把焦点从按钮上抢走。
+func _on_mouse_entered() -> void:
+	if not keyboard_focus:
+		return
+	# 悬停立刻同步逻辑焦点；mouse_entered 晚于 VNInputMode 的 hover 查询
+	if VNFocus.has_scope():
+		VNFocus.adopt(self)
+	if get_viewport().gui_get_focus_owner() != null:
+		return
+	grab_focus(true)
+
+## 鼠标移出：如果当前焦点是本滑条，立刻熄灭光晕
+func _on_mouse_exited() -> void:
+	if VNFocus.has_scope():
+		VNFocus.clear_if_current(self)
 
 ###########################################################
 #  输入
@@ -121,6 +224,29 @@ func _gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and _dragging:
 		_set_from_x(event.position.x)
 		accept_event()
+		return
+
+	# 键盘。焦点在本滑块上才会收到（Control 的键盘分发只给焦点控件）。
+	# 左右调值，上下不接 —— 留空给 Viewport 的焦点导航，于是上下键
+	# 移到相邻控件，左右键留在本控件里。
+	#
+	# is_action_pressed 的第二个参数 **必须传 true**（allow_echo）：
+	# 长按方向键时，第一次按下之后全是 echo 事件；默认 allow_echo=false
+	# 会把 echo 当成"没按"，滑条不 accept_event，Viewport 的焦点导航
+	# 接手，焦点就从滑条跑掉了。这正是"长按右焦点跑侧边栏"的原因。
+	if event is InputEventKey:
+		if event.is_action_pressed("ui_left", true) \
+				or event.is_action_pressed("ui_right", true):
+			var direction := -1.0 if event.is_action_pressed("ui_left", true) else 1.0
+			_step_value(direction)
+			# 吃掉，别让焦点导航把这次左右键也当成移动
+			accept_event()
+		elif event.is_action_released("ui_left") or event.is_action_released("ui_right"):
+			# 松开也吃掉：否则松开那一下会触发焦点导航，焦点从滑块上跑掉
+			accept_event()
+			if _key_adjusting:
+				_key_adjusting = false
+				vn_released.emit()
 
 ## 把鼠标的横坐标换算成值。
 ##
@@ -168,9 +294,20 @@ func _draw() -> void:
 	if thumb_tex != null:
 		var tw := thumb_tex.get_width()
 		var th := thumb_tex.get_height()
+		var center := Vector2(_thumb_center(at), center_y)
+		var lit := VNFocus.is_current(self) if VNFocus.has_scope() \
+			else has_focus(true)
+
+		# 焦点视觉：滑块下面一圈柔光。没有现成的焦点素材，用几何图形画，
+		# 不依赖任何一张图。只看非隐藏焦点 —— 鼠标点出来的焦点不亮，
+		# 否则点过一次滑块就永远带着一圈光。
+		if lit:
+			draw_circle(center, th * 0.72, Color(1.0, 0.96, 1.0, 0.20))
+
 		draw_texture_rect(thumb_tex,
-			Rect2(_thumb_center(at) - tw * 0.5, center_y - th * 0.5, tw, th),
-			false)
+			Rect2(center - Vector2(tw, th) * 0.5, Vector2(tw, th)),
+			false,
+			Color(1.06, 1.06, 1.06, 1.0) if lit else Color.WHITE)
 
 ## 值在 [min, max] 里的位置，0 到 1。
 ##

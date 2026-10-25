@@ -99,6 +99,8 @@ const STATE_SELECTED_PRESSED := "selected_pressed"
 		insensitive = value
 		# 同步给原生属性，让 BaseButton 自己那套也停下来
 		disabled = value
+		# 禁用时连焦点一起关掉：disabled 只拦激活，不拦 Tab/方向键
+		_sync_focus_mode()
 		if is_inside_tree():
 			_apply_visuals()
 
@@ -300,6 +302,26 @@ const STATE_FALLBACK := {
 #  命中
 ###########################################################
 
+## 是否参与键盘焦点导航。
+##
+## 默认关：剧情快捷菜单等仍以鼠标/触摸为主，不希望方向键把焦点吸到
+## 某个按钮上。需要键盘导航的界面在创建按钮时把它打开，再用 VNFocus
+## 把同一组按钮串成环。
+##
+## 关着时本按钮的 focus_mode 始终是 FOCUS_NONE —— 与旧行为完全一致。
+## 开着时由 _sync_focus_mode() 决定：可用就是 FOCUS_ALL，禁用退回 NONE。
+@export var keyboard_focus := false:
+	set(value):
+		keyboard_focus = value
+		_sync_focus_mode()
+
+## 鼠标点击激活之后是否放弃焦点。
+##
+## 必须默认关：菜单界面里鼠标点过一项，再按方向键/回车应该还能接着操作，
+## 焦点留着是好事。剧情快捷菜单相反 —— 点完"存档"之后焦点若留在那个
+## 按钮上，下一次回车会再次打开存档而不是推进台词，所以那里要打开它。
+@export var release_focus_on_mouse := false
+
 ## 是否按 alpha 通道判定可点区，对应 Ren'Py 的 focus_mask。
 ##
 ## 开着的时候，鼠标必须落在 focus_mask_state 那张图的不透明像素上
@@ -361,6 +383,9 @@ var _held := false
 ###########################################################
 
 func _ready() -> void:
+	# VNFocus 切换当前焦点时通过这个组通知所有自绘控件重画
+	add_to_group(&"vn_focus_visuals")
+
 	# 外部搭好的 Label 要纳管 —— 本类只管广播状态，
 	# 排版由调用方决定，那就得知道有哪些节点在听
 	adopt_children()
@@ -390,12 +415,19 @@ func _ready() -> void:
 	mouse_entered.connect(_on_mouse_entered)
 	mouse_exited.connect(_on_mouse_exited)
 
-	# 不接键盘与手柄焦点。
+	# 焦点模式由 keyboard_focus 决定，默认仍是 FOCUS_NONE。
 	#
-	# 本项目全是鼠标操作，没有键盘导航；而焦点一旦拿到就不会自己松手，
-	# 任何"焦点也当悬停"的判断都会被它拖住。
-	# 真要给某个界面加键盘导航时，在那一处单独改成 FOCUS_ALL 即可
-	focus_mode = Control.FOCUS_NONE
+	# 保留"默认不接键盘"的理由：焦点一旦拿到就不会自己松手，若把焦点
+	# 也当悬停，点过一次的按钮会一直亮着。需要键盘导航的界面单独打开
+	# keyboard_focus，并由 VNFocus 组环、给首项 grab_focus。
+	focus_entered.connect(_on_focus_entered)
+	focus_exited.connect(_on_focus_exited)
+	_sync_focus_mode()
+
+	# 输入模式切换时重算外观：键盘模式看焦点、鼠标模式看悬停。
+	# autoload 先于场景 ready，正常情况下这里拿到的不是 null
+	if VN.input_mode != null:
+		VN.input_mode.mode_changed.connect(_on_input_mode_changed)
 
 	_apply_visuals()
 
@@ -450,6 +482,13 @@ func _draw() -> void:
 ## 调用方一旦也接上，同一次点击就会执行两遍。详见 vn_pressed 的说明
 func _fire() -> void:
 	_play_sound("activate")
+
+	# 鼠标点出来的焦点是隐藏焦点：视觉上没亮过，留着却会让下一次回车
+	# 又触发本按钮。剧情快捷菜单靠这一句把焦点交还剧情界面。
+	# 键盘激活时 has_focus(true) 为真，焦点保留，方向键可以继续操作。
+	if release_focus_on_mouse and not has_focus(true):
+		release_focus.call_deferred()
+
 	vn_pressed.emit()
 
 ## 播一个按钮音效。which 取 "activate" 或 "hover"。
@@ -579,12 +618,23 @@ func _has_pressed_art() -> bool:
 			or not pressed_background.is_empty()
 	return not pressed_background.is_empty()
 
-## 现在算不算"悬停"。
+## 现在该不该显示"悬停/选中"那一档外观。
 ##
-## 只看鼠标，不看 has_focus() —— 键盘焦点是另一回事，而且 Godot 里
-## 点击按钮本身就会给它焦点。两者混在一起会导致点过一次之后
-## 悬停态永远为真：鼠标移开了，焦点还在，按钮就一直亮着
+## 由输入模式决定用哪套来源，而不是把两者 OR 起来：
+##   键盘模式  只看 has_focus(true)。鼠标停在别的按钮上也不亮
+##   鼠标模式  只看 is_hovered()。键盘焦点已经被 VNInputMode 清掉了
+## 两者同时亮正是这轮要解决的问题，所以这里必须互斥。
+##
+## has_focus(true) 仍然排除鼠标点击留下的隐藏焦点：鼠标模式下就算
+## BaseButton 自己 grab 了一下，也不该让按钮在鼠标移开后一直亮着。
 func _wants_hover() -> bool:
+	if VNFocus.has_scope():
+		# 作用域内只有一个当前焦点。作用域外的按钮（弹层压住的菜单、
+		# 查看器后面的格子）即使鼠标还停着也不亮。
+		return VNFocus.is_current(self)
+
+	if VN.input_mode != null and VN.input_mode.is_keyboard():
+		return has_focus(true)
 	return is_hovered()
 
 ## 把当前状态广播给底图和受管的文字节点。
@@ -705,11 +755,56 @@ func _build_mask() -> void:
 			% [name, focus_mask_state])
 
 ###########################################################
+#  键盘焦点
+###########################################################
+
+## 按 keyboard_focus 与当前可用性同步原生焦点模式。
+##
+## 禁用态必须退回 NONE：BaseButton 的 disabled 只拦激活，不拦 Tab/方向键
+## 把焦点移过来；一个灰按钮被焦点选中，屏幕上却没有任何反馈。
+func _sync_focus_mode() -> void:
+	focus_mode = Control.FOCUS_ALL if keyboard_focus and not insensitive \
+		else Control.FOCUS_NONE
+
+## 焦点进入。视觉复用 hover 那一档，音效也复用悬停音。
+##
+## 只认 has_focus(true)：鼠标点击也会发 focus_entered，但那次焦点是隐藏的，
+## 鼠标进入时已经播过悬停音，这里再播一次就是重复。
+func _on_focus_entered() -> void:
+	# 原生焦点（Tab、grab_focus）反过来同步逻辑焦点。隐藏焦点
+	#（鼠标点击留下的）不在这里同步，交给 VNInputMode 的鼠标路径。
+	if VNFocus.has_scope() and has_focus(true):
+		VNFocus.adopt(self)
+	_apply_visuals()
+	if has_focus(true) and not insensitive \
+			and (VN.input_mode == null or VN.input_mode.is_keyboard()):
+		_play_sound("hover")
+
+## VNFocus 切换当前焦点后由组通知重画
+func _refresh_focus_visuals() -> void:
+	_apply_visuals()
+
+## 焦点离开。刷新回常态或鼠标悬停态
+func _on_focus_exited() -> void:
+	_apply_visuals()
+
+## 输入模式切换。键盘模式只看焦点、鼠标模式只看悬停，
+## 所以模式一变就要把当前状态重新算一遍
+func _on_input_mode_changed(_mode: int) -> void:
+	_apply_visuals()
+
+###########################################################
 #  悬停
 ###########################################################
 
 ## 鼠标进入
 func _on_mouse_entered() -> void:
+	# mouse_entered 在 GUI 阶段才发，晚于 VNInputMode 的 _input；那时
+	# gui_get_hovered_control() 可能还是上一个控件。这里直接把逻辑焦点
+	# 收到自己身上，悬停才会立刻亮。
+	if VNFocus.has_scope() and not insensitive:
+		VNFocus.adopt(self)
+
 	# 禁用态的按钮不该有悬停反馈 —— 那会让它看起来还能点
 	if not insensitive:
 		_play_sound("hover")
@@ -721,6 +816,8 @@ func _on_mouse_entered() -> void:
 ## （松开不会再发 pressed），视觉上该跟它一致 —— 不然按住拖出按钮，
 ## 按钮会一直亮着按下态，看着像"还按着、还作数"
 func _on_mouse_exited() -> void:
+	if VNFocus.has_scope():
+		VNFocus.clear_if_current(self)
 	_held = false
 	_apply_visuals()
 

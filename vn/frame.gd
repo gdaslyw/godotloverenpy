@@ -57,6 +57,10 @@ const LAYER_TRANSITION := VNTransition.LAYER
 ## 数值定义在 VNFPSMeter 里 —— 同上。压在转场之上，黑幕期间也要看得见
 const LAYER_FPS := VNFPSMeter.LAYER
 
+## 提示条该用的层号。**框架不建这一层** —— 内容层自己做界面时用它，
+## 免得每个项目各自挑一个数、碰上转场就被盖住
+const LAYER_NOTIFY := 450
+
 ## 舞台内容层可用的最大 layer。舞台内容必须整体落在主层之下，
 ## 所以贴着 LAYER_MAIN 往下取一格。VNStage.MAX_LAYER 是本值的别名，
 ## 舞台层用它来限制内容层的 order，两个名字指的是同一件事
@@ -99,6 +103,12 @@ var warmup: VNWarmup = null
 ## 鼠标静止自动隐藏光标。纯功能节点，不参与任何逻辑
 var mouse_hide: VNMouseHide = null
 
+## 输入模式：最后按的是键盘还是鼠标。
+##
+## 与 mouse_hide 配对使用：键盘模式让它强制藏光标，鼠标模式让它立刻
+## 放出来。按钮/滑块读它决定当前该显示焦点高亮还是悬停高亮。
+var input_mode: VNInputMode = null
+
 ## 触摸适配：长按视为鼠标右键。
 ##
 ## 纯功能节点：只收事件、发事件，没有任何下游依赖。桌面上的 Windows
@@ -112,6 +122,28 @@ var touch: VNTouch = null
 ## 多出几百行没有信息量的代码。**所有权**在这里：创建、加载、落盘
 ## 都由本类负责，其它子系统只是读它的一个引用
 var config: VNConfig = null
+
+## 成就。
+##
+## 与 config 同一类：不是节点，也不由本类转发 —— 外部直接
+## VN.achievements.unlock() / .has()。所有权与创建同样在这里。
+##
+## 它内部会尝试接 Steam（桌面平台且装了 GodotSteam 时），失败就只记本地。
+## 所以本类完全不必关心 Steam 在不在 —— 那是它自己的降级逻辑
+var achievements: VNAchievements = null
+
+## Steam。与 config / achievements 同一类：不是节点，不由本类转发。
+##
+## 它回答三件事：连不连得上、当前账号有没有本作、该不该把玩家拦在门外。
+## **拦下来显示什么由内容层决定** —— 本类只把状态摆出来
+var steam: VNSteam = null
+
+## 跨周目持久化变量。
+##
+## 与 config / achievements 同一类：不是节点，不由本类转发。
+## `default persistent.xxx` 声明的量存在这里，**不进存档** ——
+## 读档、历史回跳、开新局都不碰它
+var persistent: VNPersistent = null
 
 ## 剧本包路径。取自作品配置，启动时定一次。
 ##
@@ -174,6 +206,25 @@ signal pause_started(waits_for_click: bool)
 signal stage_prefetch_requested(requests: Array)
 ## 播放器报来一批即将播出的声音路径（语音 / 音乐 / 音效）。音频层自行决定要不要预读
 signal audio_prefetch_requested(paths: Array)
+
+## 剧本请求玩家在若干选项里选一个。参数是选项表与本次请求的序号。
+##
+## 选项表每项 { caption, available, chosen, target }，含义见 VNPlayer 的
+## 同名信号。**框架不画菜单**：那属于内容层，因为选项的样式、动效、
+## 键盘操作方式每个项目都不一样，而 vn/ 要能整体复制到另一个项目里。
+##
+## 收到之后必须调 VN.choose(index) 把结果告诉播放器，否则剧情会停在原地
+signal menu_requested(items: Array, serial: int)
+
+## 剧情位置被**整体替换**了（读档、历史回跳、热重载）。
+##
+## 与"推进到下一句"是两件事：推进是播放器自己走的，界面上属于旧位置的
+## 东西会自然被替换掉；替换是有人从外面把游标搬走了，那些东西不会跟着动。
+##
+## 订阅方要在这个信号之后判断自己的界面还成不成立 —— 本信号只报告
+## "位置换了"，不替任何人决定该删什么。发在替换**之后**，因为那时
+## 播放器已经停在新位置上、`is_waiting_menu()` 之类的查询才是准的
+signal position_replaced
 
 ## 玩家点中了台词里的 {a=值} 链接。参数是剥掉标签层前缀之后的原始值。
 ##
@@ -240,7 +291,23 @@ func _ready() -> void:
 	config.load_config()
 	config.load_seen()
 	config.load_seen_images()
+	config.load_chosen()
 	config.apply_audio()
+
+	# 3.2 Steam。连不上是常态 —— 编辑器里、安卓上、客户端没开，都落在
+	#     UNAVAILABLE。那不是错误，state() 会说明是哪种情况
+	steam = VNSteam.new()
+	steam.setup()
+
+	# 3.3 成就。本地永远可用；Steam 那一路由上面这次初始化的结果决定。
+	#     必须先于 player —— player 执行 unlock 时要往它里面写
+	achievements = VNAchievements.new()
+	achievements.setup(steam)
+
+	# 3.4 持久化变量。只能读文件，初值要等剧本加载之后才补得上 ——
+	#     那一步在 VNPlayer.start() 里（它才拿得到 default 表）
+	persistent = VNPersistent.new()
+	persistent.setup()
 
 	# 窗口尺寸。必须排在 load_config() 之后 —— 玩家上次选的全屏/窗口、
 	# 以及他自己拖出来的那个大小，都刚从 settings.cfg 里读出来
@@ -260,6 +327,8 @@ func _ready() -> void:
 	#      所以它们必须先 add_child 完毕（add_child 时会立刻跑各自的 _ready）
 	session = VNSession.new()
 	session.name = "Session"
+	# 台词里的 [persistent.xxx] 要靠它取值。只读引用 —— 写入走 player
+	session.persistent = persistent
 	add_child(session)
 
 	audio = VNAudio.new()
@@ -272,7 +341,7 @@ func _ready() -> void:
 	# 必须在 add_child 之前 —— 后面的安装开发钩子会立刻编译一次剧本包，
 	# 而它读的就是这个路径
 	player.package_path = package_path
-	player.setup(session, audio, config)
+	player.setup(session, audio, config, achievements, persistent)
 	add_child(player)
 
 	# 8. 信号出口。必须在 player 开始播之前接好
@@ -320,6 +389,14 @@ func _ready() -> void:
 	touch.name = "Touch"
 	add_child(touch)
 
+	# 15. 输入模式。必须排在 mouse_hide 之后 —— 它要拿到那个节点，
+	#     才能在键盘/鼠标切换时强制藏光标或放光标。本身只监听输入、
+	#     改一个模式字段，没有任何装配依赖，所以排在最后
+	input_mode = VNInputMode.new()
+	input_mode.name = "InputMode"
+	input_mode.mouse_hide = mouse_hide
+	add_child(input_mode)
+
 ## 退出时把还没落盘的东西补上：已读记录（节流窗口内的标记）与玩家拖出来的
 ## 窗口尺寸（拖动时只在内存里更新，每帧写盘太浪费）。
 ##
@@ -329,6 +406,7 @@ func _exit_tree() -> void:
 	if config != null:
 		config.save_seen()
 		config.save_seen_images()
+		config.save_chosen()
 		# 玩家拖出来的窗口尺寸只留在内存里（拖动时每帧写盘太浪费），
 		# 退出时补上
 		config.save_config()
@@ -387,6 +465,8 @@ func _bridge_signals() -> void:
 		func(requests: Array) -> void: stage_prefetch_requested.emit(requests))
 	player.audio_prefetch_requested.connect(
 		func(paths: Array) -> void: audio_prefetch_requested.emit(paths))
+	player.menu_requested.connect(
+		func(items: Array, serial: int) -> void: menu_requested.emit(items, serial))
 
 	# lambda 的参数**不要**叫 stage：本类自己有 stage() 方法（转发给
 	# session），同名参数会触发 SHADOWED_VARIABLE。同理，将来往这里加
@@ -434,6 +514,19 @@ func start(label_name: String = "", mode: int = StartMode.CONTINUE) -> bool:
 ## 推进到下一句台词
 func advance() -> void:
 	player.advance()
+
+## 玩家在菜单里选了第 index 项。内容层收到 menu_requested 之后，玩家点中
+## 某一项时调它。
+##
+## 与 advance() 是同一类动作（把播放器往下推一步），只是这一步带着选择。
+## 选不中（下标越界、那一项条件不成立、当前根本没菜单）时播放器只报错，
+## 不动游标 —— 选择是玩家的动作，界面出错不该把剧情推进到别处
+func choose(index: int) -> void:
+	player.choose(index)
+
+## 是否停在菜单上等玩家选
+func is_waiting_menu() -> bool:
+	return player.is_waiting_menu()
 
 ## 跳到剧本里的一个 label。由界面在玩家点中台词里的 {jump=} 链接时调用。
 ## 目标不存在时播放器只报错并照常往下走，不会中断这一局
@@ -591,7 +684,7 @@ func _unify_cursor_shapes() -> void:
 ##      下面那次重译才是用新字体画出来的
 ##   4. 重译当前句 —— 停留在对话框上的那句要跟着变
 ##   5. 广播 language_changed —— 界面层据此重建
-func _apply_language(locale: String, notify: bool) -> void:
+func _apply_language(locale: String, broadcast: bool) -> void:
 	# 把归一后的值写回配置。启动时 config.language 可能是空串（玩家从没
 	# 设置过），写实之后 save_config() 落盘的就是规范值，而不是空串 ——
 	# 空串虽然也能被 resolved_language() 兜住，但打开 settings.cfg 看时
@@ -605,7 +698,7 @@ func _apply_language(locale: String, notify: bool) -> void:
 	# 引擎真正加载了什么，而不是 project.godot 里写了什么
 	_check_translations()
 
-	if not notify:
+	if not broadcast:
 		return
 
 	dialog_font_changed.emit(config.dialog_font_path())
@@ -677,13 +770,22 @@ func current_label() -> String:
 func capture_state() -> Dictionary:
 	return player.capture_state()
 
-## 从一份存档数据恢复整局状态，并立刻播出存档处那一句
+## 从一份存档数据恢复整局状态，并立刻播出存档处那一句。
+##
+## 成功后发 position_replaced：界面上属于旧位置的东西不会自己让位，
+## 尤其选项界面 —— 它挂在主层、不在任何栈里（见 UIScheduler 的说明）
 func restore_state(data: Dictionary) -> bool:
-	return player.restore_state(data)
+	var ok := player.restore_state(data)
+	if ok:
+		position_replaced.emit()
+	return ok
 
-## 回跳到历史里的第 index 条
+## 回跳到历史里的第 index 条。成功后的信号理由同上
 func jump_to_history(index: int) -> bool:
-	return player.jump_to_history(index)
+	var ok := player.jump_to_history(index)
+	if ok:
+		position_replaced.emit()
+	return ok
 
 ## 从磁盘重新读一遍剧本包
 func reload_story() -> bool:
@@ -763,6 +865,32 @@ func has_var(path: String) -> bool:
 ## 走的是和剧本 set 完全相同的赋值路径
 func set_var(path: String, value: Variant) -> bool:
 	return player.set_var(path, value)
+
+###########################################################
+#  提示
+###########################################################
+
+## 有人请求弹一条提示。参数是文案与停留秒数。
+##
+## **框架不画提示条** —— 这里只把请求广播出去。谁接谁画，不接就什么都不发生。
+## 与 menu_requested / quit_requested 同一套做法：判定与调度在框架，
+## 长什么样是内容层的事。
+##
+## 要做界面就接这个信号，并用 VNFrame.LAYER_NOTIFY 建自己的 CanvasLayer
+signal notify_requested(text: String, seconds: float)
+
+## 默认停留秒数。内容层接信号时可以拿它当缺省值 —— 框架给这个数的唯一
+## 理由是"两秒"这个经验值值得统一，而不是替内容层决定
+const NOTIFY_SECONDS := 2.0
+
+## 请求弹一条提示。对应 Ren'Py 的 renpy.notify()。
+##
+## "做完了"这类反馈用它 —— 存档成功、设置改动、非 Steam 平台上的成就解锁。
+## 没有监听者时它就是一次空 emit，不会报错，也不会留下半截状态
+func notify(text: String, seconds: float = NOTIFY_SECONDS) -> void:
+	if text.is_empty():
+		return
+	notify_requested.emit(text, seconds)
 
 ###########################################################
 #  音频（转发到 Audio）

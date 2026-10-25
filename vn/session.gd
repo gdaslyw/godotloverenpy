@@ -68,6 +68,13 @@ var _roles: Dictionary = {}
 ## 这里不做类型推断
 var _vars: Dictionary = {}
 
+## 跨周目持久化变量。**只读用途** —— 台词里的 [persistent.xxx] 靠它取值。
+##
+## 它的写入归 VNPlayer（剧本 set）与 VNPersistent（落盘），本类一个字都不写。
+## 之所以挂在这里而不是让 interpolate 多收一个参数：插值会在显示层的
+## 每一句台词上调用，多一个参数就等于每次都要重新传一遍同样的东西
+var persistent: VNPersistent = null
+
 ## 变量与角色属性的**变更日志**：这一句显示之前被改过的路径，在改之前的值。
 ##
 ## 历史回跳要回到"那一句的数值"。全量快照 × 250 条会让存档胖几十倍，所以
@@ -278,7 +285,7 @@ func set_var(path: String, value: Variant, how: String, notify := true) -> void:
 
 	var leaf := segments[segments.size() - 1]
 	var old: Variant = node.get(leaf)
-	var next: Variant = _combine(old, value, how)
+	var next: Variant = combine(old, value, how)
 	node[leaf] = next
 
 	if notify and next != old:
@@ -392,7 +399,12 @@ func reset_vars(defaults: Array) -> void:
 	for d in defaults:
 		if not (d is Dictionary):
 			continue
-		set_var(String(d.get("path", "")),
+		var path := String(d.get("path", ""))
+		# persistent 前缀的声明归 VNPersistent 管。塞进这一局的变量表会让
+		# 它跟着存档走，也就失去了"跨周目"的意义
+		if VNPersistent.is_persistent_path(path):
+			continue
+		set_var(path,
 			decode_value(String(d.get("kind", "s")), String(d.get("value", ""))),
 			"=", false)
 
@@ -413,7 +425,10 @@ static func decode_value(kind: String, raw: String) -> Variant:
 ##
 ## old 为 null（变量还不存在）时一律取新值 —— 相当于从类型的零值起算，
 ## 于是 `set gold += 10` 在没先赋初值时也能得到 10
-func _combine(old: Variant, value: Variant, how: String) -> Variant:
+##
+## 静态且公开：VNPersistent 复用同一套合成规则与报错措辞。两边各写一份的话，
+## 迟早会出现"普通变量支持 += 字符串、persistent 不支持"这种莫名其妙的差异
+static func combine(old: Variant, value: Variant, how: String) -> Variant:
 	if how == "=" or old == null:
 		return value
 
@@ -447,16 +462,26 @@ static func _is_number(value: Variant) -> bool:
 ## 调用时机固定在 tr() **之后**：译文里同样可以写 [gold]，占位符不参与
 ## 翻译匹配（msgid 里带的是名字，译完再换值）。
 ##
-## 没有变量表或文本里没有方括号时直接返回 —— 绝大多数台词走这条短路
+## 文本里没有方括号时直接返回 —— 绝大多数台词走这条短路。
+## **不再判 _vars 是否为空**：剧本可能一个普通变量都没有、只声明了
+## persistent，那时按旧短路条件插值永远不会发生
 func interpolate(text: String) -> String:
-	if _vars.is_empty() or not text.contains("["):
+	if not text.contains("["):
 		return text
 
 	var re := _placeholder_re()
 	var out := ""
 	var last := 0
 	for found in re.search_all(text):
-		var value: Variant = var_value(found.get_string(1))
+		var path := found.get_string(1)
+		var value: Variant = var_value(path)
+
+		# 普通变量表里查不到时回落到持久化表。[gold] 与 [persistent.foo]
+		# 在台词里应该一样自然，谁负责存是框架的事，作者不该关心
+		if value == null and persistent != null \
+				and VNPersistent.is_persistent_path(path):
+			value = persistent.get_var(path)
+
 		if value == null:
 			continue
 		out += text.substr(last, found.get_start() - last)
